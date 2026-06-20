@@ -1331,14 +1331,17 @@ by `CLIENT_ID`. To add target **N** (e.g. `nas-c`):
    kubectl --context cluster-b apply -f cluster-b/cronjob-manifests.yaml
    ```
 
-2. **Deploy this target's shared resources** — copy the §9A.1 manifests, pointing the
+2. **Deploy this target's shared resources** — copy and adapt the §9A.1 manifests, pointing the
    PV/PVC at THIS target's NAS (its IP/export/size). Keep namespace `ea-pmc`.
 
 3. **Bootstrap with a full seed (one-time)** — a lookback manifest never lists the whole
-   dataset, so a brand-new target must be seeded first. Deploy the §10 Deployment with
+   dataset, so a brand-new target must be seeded first. Copy §10's
+   `cluster-a/deployment-client.yaml` to `cluster-c/deployment-client.yaml`, set
    `SYNC_MODE=parallel` (no time limit) and `CLIENT_ID=nas-c`; let it finish, then delete it:
    ```bash
-   kubectl --context cluster-c apply -f cluster-c/deployment-client.yaml   # SYNC_MODE=parallel
+   # Copy + adapt §10's cluster-a/deployment-client.yaml → cluster-c/deployment-client.yaml
+   # (SYNC_MODE=parallel, CLIENT_ID=nas-c, new cluster's PVC name), then:
+   kubectl --context cluster-c apply -f cluster-c/deployment-client.yaml
    # …wait for the initial bulk sync to complete in logs…
    kubectl --context cluster-c delete -f cluster-c/deployment-client.yaml
    ```
@@ -1348,7 +1351,7 @@ by `CLIENT_ID`. To add target **N** (e.g. `nas-c`):
    (the generator runs at `50 */2 * * *`; a client at `0 */2 * * *` pulls 10 min later).
 
 5. **Add the weekly reconcile** — a second CronJob with `SYNC_MODE=parallel` (e.g.
-   `0 3 * * 0`) and the same `CLIENT_ID`, per §12. This backstops any change older than
+   `0 2 * * 0`) and the same `CLIENT_ID`, per §12. This backstops any change older than
    the client's lookback window.
 
 > `REMOTE_HOST` for every target is the **same** source — Cluster B's Istio external IP

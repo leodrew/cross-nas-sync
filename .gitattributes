@@ -1,0 +1,5 @@
+# This repo REQUIRES LF line endings everywhere.
+# The deployment guide embeds shell scripts (tini shebangs) and YAML that BREAK
+# if checked out with CRLF — see CLAUDE.md "CRLF will silently break everything".
+# Force LF in the repo AND on checkout on every platform. Do not change.
+* text=auto eol=lf

@@ -1,0 +1,9 @@
+# local scratch
+/tmp/
+*.tmp
+.DS_Store
+Thumbs.db
+
+# tooling / agent scratch (not part of the deliverable)
+.claude/
+.superpowers/

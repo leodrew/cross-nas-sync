@@ -666,6 +666,11 @@ kubectl exec deployment/nas-sync-server -n ea-pmc -c nas-sync-server -- ss -tlnp
 kubectl exec deployment/nas-sync-server -n ea-pmc -c nas-sync-server -- rsync --list-only rsync://localhost:8787/nas-data/ | head
 kubectl get svc $INGRESS_SVC -n istio-system -o jsonpath='{range .spec.ports[*]}{.name}:{.port}{"\n"}{end}' | grep 8787
 nc -zv ${ISTIO_EXTERNAL_IP} 8787
+
+# (incremental) confirm a manifest exists per registered client:
+kubectl exec deployment/nas-sync-server -n ea-pmc -c nas-sync-server -- \
+  sh -c 'for d in /mnt/nas-source/.nas-sync-state/clients/*/; do \
+    echo "$d: $(wc -l < "$d/sync-manifest.txt" 2>/dev/null || echo MISSING) files"; done'
 ```
 
 ---
@@ -1590,14 +1595,28 @@ kubectl edit cronjob nas-sync-client -n ea-pmc   # set SYNC_MODE
 # For parallel, ensure CPU limit allows workers; tune PARALLEL_WORKERS
 ```
 
-### Incremental: manifest not found
+### Incremental: manifest not found / client degraded to full sync
+
+A client logs `Manifest fetch failed — FULL sync fallback` when its
+`clients/<CLIENT_ID>/sync-manifest.txt` is missing. Common causes:
 
 ```bash
-# Check manifest job ran and wrote the file
-kubectl logs job/<manifest-job> -n ea-pmc
-kubectl exec deployment/nas-sync-server -n ea-pmc -c nas-sync-server -- \
-  ls -la /mnt/nas-source/.nas-sync-state/
+# 1. Is CLIENT_ID registered? It must appear in the registry ConfigMap:
+kubectl --context cluster-b get configmap nas-sync-clients -n ea-pmc -o yaml | grep -A20 clients.txt
+
+# 2. Did the generator run and write that client's manifest?
+kubectl --context cluster-b logs job/<manifest-job> -n ea-pmc
+kubectl --context cluster-b exec deployment/nas-sync-server -n ea-pmc -c nas-sync-server -- \
+  ls -la /mnt/nas-source/.nas-sync-state/clients/<CLIENT_ID>/
+
+# 3. Does the client's CLIENT_ID env match the registry id exactly?
+kubectl --context cluster-c get cronjob nas-sync-client -n ea-pmc \
+  -o jsonpath='{.spec.jobTemplate.spec.template.spec.containers[0].env}' | tr ',' '\n' | grep -A1 CLIENT_ID
 ```
+
+Fix: add the missing line to the registry (§6.2), re-apply `cronjob-manifests.yaml`, and
+wait for the next generator run. A new target also needs its one-time `parallel` bootstrap
+(§9A.3 step 3) — incremental alone never seeds the full dataset.
 
 ### Connection refused 8787
 

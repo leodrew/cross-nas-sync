@@ -1498,9 +1498,9 @@ kubectl apply -f cluster-a/cronjob-client.yaml
 ### CronJob
 
 ```bash
-kubectl create job --from=cronjob/nas-sync-client test-v313 -n ea-pmc
+kubectl create job --from=cronjob/nas-sync-client test-v314 -n ea-pmc
 sleep 5
-POD=$(kubectl get pods -n ea-pmc -l job-name=test-v313 -o jsonpath='{.items[0].metadata.name}')
+POD=$(kubectl get pods -n ea-pmc -l job-name=test-v314 -o jsonpath='{.items[0].metadata.name}')
 
 # Watch it reach Completed (not stuck)
 kubectl get pod $POD -n ea-pmc -w
@@ -1512,7 +1512,7 @@ kubectl logs $POD -n ea-pmc -c nas-sync-client
 kubectl exec $POD -n ea-pmc -c nas-sync-client -- head -1 /userapp/scripts/dispatch-sync.sh | cat -A
 # Expected: #!/bin/bash$ (no ^M)
 
-kubectl delete job test-v313 -n ea-pmc
+kubectl delete job test-v314 -n ea-pmc
 ```
 
 ### Deployment

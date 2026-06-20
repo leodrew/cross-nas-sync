@@ -1247,6 +1247,8 @@ spec:
                 # ===== SELECT SYNC MODE HERE =====
                 - name: SYNC_MODE
                   value: "incremental"          # ◄ standard | parallel | incremental
+                - name: CLIENT_ID
+                  value: "nas-a"                 # ◄ MODIFY — must match a registry line (§6.2); used by incremental
                 - name: PARALLEL_WORKERS
                   value: "6"                     # used if SYNC_MODE=parallel
                 # =================================
@@ -1313,6 +1315,45 @@ kubectl apply -f cluster-a/cronjob-client.yaml
 # Confirm the claim is Bound (not Pending) before running a sync:
 kubectl get pvc nas-a-target-pvc -n ea-pmc
 ```
+
+---
+
+### 9A.3 Adding more target clusters (multi-target)
+
+Each target NAS is its own cluster running this same client image, distinguished only
+by `CLIENT_ID`. To add target **N** (e.g. `nas-c`):
+
+1. **Register it** — add a line to the `nas-sync-clients` registry on Cluster B (§6.2)
+   and re-apply:
+   ```bash
+   # cluster-b/cronjob-manifests.yaml → data.clients.txt
+   #   nas-c   6
+   kubectl --context cluster-b apply -f cluster-b/cronjob-manifests.yaml
+   ```
+
+2. **Deploy this target's shared resources** — copy the §9A.1 manifests, pointing the
+   PV/PVC at THIS target's NAS (its IP/export/size). Keep namespace `ea-pmc`.
+
+3. **Bootstrap with a full seed (one-time)** — a lookback manifest never lists the whole
+   dataset, so a brand-new target must be seeded first. Deploy the §10 Deployment with
+   `SYNC_MODE=parallel` (no time limit) and `CLIENT_ID=nas-c`; let it finish, then delete it:
+   ```bash
+   kubectl --context cluster-c apply -f cluster-c/deployment-client.yaml   # SYNC_MODE=parallel
+   # …wait for the initial bulk sync to complete in logs…
+   kubectl --context cluster-c delete -f cluster-c/deployment-client.yaml
+   ```
+
+4. **Switch to routine incremental** — deploy the §9A.2 CronJob with
+   `SYNC_MODE=incremental` and `CLIENT_ID=nas-c`, scheduled AFTER the generator
+   (the generator runs at `50 */2 * * *`; a client at `0 */2 * * *` pulls 10 min later).
+
+5. **Add the weekly reconcile** — a second CronJob with `SYNC_MODE=parallel` (e.g.
+   `0 3 * * 0`) and the same `CLIENT_ID`, per §12. This backstops any change older than
+   the client's lookback window.
+
+> `REMOTE_HOST` for every target is the **same** source — Cluster B's Istio external IP
+> (`ISTIO_EXTERNAL_IP_HERE`). Targets differ only by `CLIENT_ID`, their local NAS PV/PVC,
+> and their registry lookback. The source rsync daemon and generator are shared, unchanged.
 
 ---
 

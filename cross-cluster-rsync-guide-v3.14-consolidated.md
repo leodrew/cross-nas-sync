@@ -8,6 +8,12 @@
 >
 > **Port:** 8787 | **Delete:** Disabled | **Logging:** Console only | **Namespace:** ea-pmc
 >
+> **v3.14 adds multi-target:** one source NAS B feeds many target clusters. The manifest
+> generator does one `find` walk and fans out a **per-client manifest** (keyed by
+> `CLIENT_ID`) using a stateless **lookback window** — no markers, source stays read-only.
+> Targets are listed in one registry ConfigMap (§6.2); add a target by adding a line (§9A.3).
+> See the migration appendix to move an existing v3.13 single-target deployment forward.
+>
 > **One image, selectable behavior** via `SYNC_MODE` env var:
 > - `standard` — single rsync (original)
 > - `parallel` — N concurrent workers split by top-level folder (faster walk)
@@ -58,6 +64,10 @@ Two independent choices:
 - **SYNC_MODE** (standard/parallel/incremental) → which sync algorithm runs
 
 Both combine freely. E.g. CronJob+incremental for routine, Deployment+parallel for bulk.
+
+**Multi-target (v3.14):** a third axis — `CLIENT_ID` — selects which per-client manifest a
+target pulls. One source daemon + one generator serve all targets; each target is its own
+cluster differing only by `CLIENT_ID`, its local NAS, and its registry lookback (§6.2, §9A.3).
 
 ---
 
@@ -137,7 +147,7 @@ cd cluster-b/scripts
 ```bash
 #!/bin/bash
 #############################################
-# NAS Sync Server v3.13 — Entrypoint
+# NAS Sync Server v3.14 — Entrypoint
 #############################################
 set +e
 RSYNC_PORT="${RSYNC_PORT:-8787}"
@@ -146,7 +156,7 @@ log() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"; }
 log_error() { echo "$(date '+%Y-%m-%d %H:%M:%S') - ERROR: $1" >&2; }
 
 log "========================================"
-log "NAS Sync Server v3.13 (Cluster B)"
+log "NAS Sync Server v3.14 (Cluster B)"
 log "  Port: ${RSYNC_PORT} | Source: /mnt/nas-source"
 log "========================================"
 
@@ -993,7 +1003,7 @@ exit $SYNC_EXIT
 #############################################
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"; }
 
-log "=== NAS Sync Client v3.13 (Deployment, SYNC_MODE=${SYNC_MODE:-standard}) ==="
+log "=== NAS Sync Client v3.14 (Deployment, SYNC_MODE=${SYNC_MODE:-standard}) ==="
 log "Cron: ${CRON_SCHEDULE}"
 
 printenv | grep -E '^(REMOTE_|LOCAL_|SYNC_|RSYNC_|EXCLUDE_|CHECK_|TZ|PARALLEL_|MANIFEST_)' > /etc/environment
@@ -1571,7 +1581,7 @@ kubectl patch cronjob nas-sync-client -n ea-pmc --type='json' \
 
 ### `tini exec ... No such file or directory`
 
-CRLF in a script. v3.13 build strips + verifies, so rebuild fixes it:
+CRLF in a script. v3.14 build strips + verifies, so rebuild fixes it:
 ```bash
 docker run --rm ${REGISTRY}/nas-sync-client:3.14 \
   head -1 /userapp/scripts/dispatch-sync.sh | cat -A
@@ -1643,11 +1653,11 @@ cluster-b/
 ├── service.yaml                    # 5.5
 ├── gateway.yaml                    # 5.6  ← MODIFY selector
 ├── virtualservice.yaml             # 5.7
-├── cronjob-manifests.yaml          # 6.1  (incremental only; ConfigMap + CronJob)
+├── cronjob-manifests.yaml          # 6.1  (incremental only: registry ConfigMap + CronJob)
 └── scripts/
     ├── Dockerfile                  # 4.4  (CRLF-safe)
     ├── entrypoint.sh              # 4.2
-    └── generate-manifests.sh      # 4.3  (incremental only)
+    └── generate-manifests.sh      # 4.3  (incremental only: multi-client fan-out)
 
 + Patch non-route ingressgateway port 8787 (5.8)
 ```
@@ -1676,24 +1686,25 @@ cluster-a/
 ### Deploy Order
 
 ```
-1. Build & push server image v3.13           (Step 1)
+1. Build & push server image v3.14           (Step 1)
 2. Deploy Cluster B server + patch GW         (Step 2)
-3. (incremental only) Deploy manifest CronJob (Step 3)
+3. (incremental only) Deploy registry + manifest CronJob (Step 3 / §6.2)
 4. Verify Cluster B                           (Step 4)
-5. Build & push client image v3.13            (Step 5)
+5. Build & push client image v3.14            (Step 5)
 6. Deploy Cluster A shared resources          (9A.1)
 7. Choose k8s type:
    • CronJob    → cluster-a/cronjob-client.yaml    (Step 6A)
    • Deployment → cluster-a/deployment-client.yaml (Step 6B)
    Set SYNC_MODE in whichever you deploy.
 8. Verify & test                              (Step 7)
+9. (multi-target) Repeat 6–8 per extra target, distinct CLIENT_ID  (§9A.3)
 ```
 
 ---
 
 ## What This Consolidates
 
-| Capability | Source Version | Status in v3.13 |
+| Capability | Source Version | Status in v3.14 |
 |-----------|----------------|-----------------|
 | Port 8787 | v3.4 | ✓ |
 | No-delete (keep target-only files) | v3.5 | ✓ |
@@ -1709,4 +1720,33 @@ cluster-a/
 | Incremental change-list speedup | (speedup doc) | ✓ (8.4 + Step 6, SYNC_MODE=incremental) |
 | Both k8s types in deployment YAMLs | (this request) | ✓ (Step 6A + 6B) |
 | Explicit target NFS PV+PVC | (this request) | ✓ (9A.1) |
-| Manifest state on source NAS (no PVC) | (this request) | ✓ (§6) |
+| Manifest state on source NAS (no PVC) | v3.13 | ✓ (§6) |
+| Single-target incremental (one marker) | v3.13 | superseded by multi-target |
+| Multi-target: per-client manifests | v3.14 | ✓ (§6.1, §8.4) |
+| Stateless lookback window (no markers) | v3.14 | ✓ (§4.3, §6.2) |
+| Single-walk fan-out generator | v3.14 | ✓ (§4.3) |
+| Client registry ConfigMap | v3.14 | ✓ (§6.2) |
+| Per-target deploy walkthrough | v3.14 | ✓ (§9A.3) |
+
+---
+
+## Appendix: Migrating v3.13 (single-target) → v3.14 (multi-target)
+
+The existing single client keeps working; cut it over to the per-client model:
+
+1. **Rebuild the server image** (`:3.14`) so `generate-manifests.sh` replaces the old
+   `generate-manifest.sh` (§4.3–§4.5), and rebuild/redeploy nothing else on the source
+   except the manifest CronJob.
+2. **Create the registry** with your existing client as `nas-a` (§6.2). Pick its lookback
+   from its current schedule (2h CronJob → `6`).
+3. **Replace** `cronjob-manifest.yaml` with `cronjob-manifests.yaml` (§6.1) and apply.
+   The generator now writes `.nas-sync-state/clients/nas-a/sync-manifest.txt`.
+4. **Add `CLIENT_ID=nas-a`** to the existing client CronJob (§9A.2) and apply. It now
+   fetches the per-client path instead of the old global `.nas-sync-state/sync-manifest.txt`.
+5. **Decommission the old global manifest** — once the client logs the per-client path,
+   delete the stale `.nas-sync-state/sync-manifest.txt` and `last-sync-marker` on the
+   source NAS (the v3.14 model is stateless and no longer uses a marker).
+6. **Add further targets** per §9A.3.
+
+> No data re-sync is required for the existing target: its files already match. The first
+> v3.14 incremental run simply pulls whatever changed within `nas-a`'s lookback window.

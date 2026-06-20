@@ -819,7 +819,13 @@ LOCAL_NAS_PATH="${LOCAL_NAS_PATH:-/mnt/nas-target}"
 RSYNC_PASSWORD_FILE="${RSYNC_PASSWORD_FILE:-/userapp/config/rsync.password}"
 EXCLUDE_FILE="${EXCLUDE_FILE:-/userapp/config/rsync-exclude.txt}"
 RSYNC_TIMEOUT="${RSYNC_TIMEOUT:-14400}"
-MANIFEST_NAME="${MANIFEST_NAME:-.nas-sync-state/sync-manifest.txt}"
+# Per-client manifest path (multi-target). CLIENT_ID must match a registry line (§6.2).
+CLIENT_ID="${CLIENT_ID:-}"
+if [ -n "$CLIENT_ID" ]; then
+    MANIFEST_NAME="${MANIFEST_NAME:-.nas-sync-state/clients/${CLIENT_ID}/sync-manifest.txt}"
+else
+    MANIFEST_NAME="${MANIFEST_NAME:-.nas-sync-state/sync-manifest.txt}"
+fi
 
 MANIFEST_LOCAL="/tmp/sync-manifest.txt"
 REMOTE_URL="rsync://${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PORT}/${REMOTE_MODULE}"
@@ -833,7 +839,7 @@ RSYNC_FLAGS="$RSYNC_FLAGS --password-file=$RSYNC_PASSWORD_FILE"
 [ -f "$EXCLUDE_FILE" ] && RSYNC_FLAGS="$RSYNC_FLAGS --exclude-from=$EXCLUDE_FILE"
 
 START=$(date +%s)
-log "=== NAS SYNC (incremental) ==="
+log "=== NAS SYNC (incremental) client=${CLIENT_ID:-<legacy>} ==="
 
 [ -r "$RSYNC_PASSWORD_FILE" ] || die "Password file not readable"
 nc -z -w 10 "$REMOTE_HOST" "$REMOTE_PORT" 2>/dev/null || die "Remote not reachable"

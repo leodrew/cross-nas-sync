@@ -169,59 +169,101 @@ log "Starting rsync daemon on port ${RSYNC_PORT}..."
 exec rsync --daemon --no-detach --port=${RSYNC_PORT} --log-file=/dev/stdout
 ```
 
-### 4.3 File: `cluster-b/scripts/generate-manifest.sh`
+### 4.3 File: `cluster-b/scripts/generate-manifests.sh`
 
-> Used only for `incremental` mode. Produces the changed-file list.
+> Used only for `incremental` mode. One `find` walk → per-client manifests by
+> stateless lookback window. The set of clients (and each client's lookback hours)
+> comes from the registry ConfigMap mounted at `/userapp/config/clients.txt` (§6.2).
 
 ```bash
 #!/bin/bash
 #############################################
-# Manifest Generator (Cluster B)
-# Lists files changed since last sync for
-# incremental mode (--files-from on client).
+# Multi-Client Manifest Generator (Cluster B) — v3.14
+# ONE find walk; fan-out per-client manifests by a
+# stateless lookback window. No markers, no per-client walk.
 #############################################
 set +e
 
 SOURCE_PATH="${SOURCE_PATH:-/mnt/nas-source}"
-# State dir now lives ON the source NAS (no Kubernetes PVC): survives pod
-# rescheduling and adds no new storage dependency (the NAS is already required).
+# State lives ON the source NAS (no Kubernetes PVC).
 STATE_DIR="${STATE_DIR:-${SOURCE_PATH}/.nas-sync-state}"
-MARKER="${STATE_DIR}/last-sync-marker"
-MARKER_CANDIDATE="${STATE_DIR}/last-sync-marker.candidate"
-MANIFEST="${MANIFEST_PATH:-${STATE_DIR}/sync-manifest.txt}"
+CLIENTS_DIR="${STATE_DIR}/clients"
+# Registry: lines "<client_id> <lookback_hours>"; # comments + blanks ignored.
+REGISTRY_FILE="${REGISTRY_FILE:-/userapp/config/clients.txt}"
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"; }
 
-mkdir -p "$STATE_DIR"
+[ -r "$REGISTRY_FILE" ] || { log "ERROR: registry $REGISTRY_FILE not readable"; exit 1; }
 
-# Hygiene: drop any orphan candidate left by a crashed previous run.
-# Safe because the CronJob uses concurrencyPolicy: Forbid (no concurrent run).
-rm -f "$MARKER_CANDIDATE"
+mkdir -p "$CLIENTS_DIR"
+NOW=$(date +%s)
 
 log "========================================"
-log "Manifest Generator v3.13"
+log "Multi-Client Manifest Generator v3.14"
 log "  Source: $SOURCE_PATH | State: $STATE_DIR"
+log "  Registry: $REGISTRY_FILE"
 log "========================================"
 
-# Capture scan start time; files changed during scan caught next run
-touch "$MARKER_CANDIDATE"
+# Parse registry -> parallel arrays; pre-create empty temp manifests.
+CLIENT_IDS=(); THRESHOLDS=()
+while read -r CID HOURS _rest; do
+    case "$CID" in ''|\#*) continue;; esac
+    case "$HOURS" in ''|*[!0-9]*) log "WARN: bad lookback for '$CID' ('$HOURS') — skipping"; continue;; esac
+    THRESH=$(( NOW - HOURS * 3600 ))
+    mkdir -p "${CLIENTS_DIR}/${CID}"
+    : > "${CLIENTS_DIR}/${CID}/sync-manifest.txt.tmp"
+    CLIENT_IDS+=("$CID"); THRESHOLDS+=("$THRESH")
+    log "  client=$CID lookback=${HOURS}h threshold=$THRESH"
+done < "$REGISTRY_FILE"
 
-if [ ! -f "$MARKER" ]; then
-    log "No marker — first run. Signaling FULL_SYNC."
-    echo "FULL_SYNC" > "$MANIFEST"
-else
-    log "Generating changed-file list (newer than marker)..."
-    find "$SOURCE_PATH" \
-        -path "$SOURCE_PATH/.snapshot" -prune -o \
-        -path "$STATE_DIR" -prune -o \
-        -type f -newer "$MARKER" -printf '%P\n' \
-        > "$MANIFEST" 2>/dev/null
-    CHANGED=$(wc -l < "$MANIFEST")
-    log "Found $CHANGED changed files"
-fi
+[ "${#CLIENT_IDS[@]}" -gt 0 ] || { log "ERROR: no valid clients in registry"; exit 1; }
 
-mv "$MARKER_CANDIDATE" "$MARKER"
-log "Manifest written to $MANIFEST. Done."
+# awk config: one line per client => id<TAB>threshold<TAB>tmpfile
+AWK_CONF="$(mktemp)"
+i=0
+while [ "$i" -lt "${#CLIENT_IDS[@]}" ]; do
+    printf '%s\t%s\t%s\n' "${CLIENT_IDS[$i]}" "${THRESHOLDS[$i]}" \
+        "${CLIENTS_DIR}/${CLIENT_IDS[$i]}/sync-manifest.txt.tmp" >> "$AWK_CONF"
+    i=$((i+1))
+done
+
+log "Walking source (one pass)..."
+find "$SOURCE_PATH" \
+    -path "$SOURCE_PATH/.snapshot" -prune -o \
+    -path "$STATE_DIR" -prune -o \
+    -type f -printf '%T@ %P\n' 2>/dev/null \
+| awk -v conf="$AWK_CONF" '
+    BEGIN {
+        n = 0
+        while ((getline line < conf) > 0) {
+            split(line, a, "\t"); n++; thr[n] = a[2] + 0; out[n] = a[3]
+        }
+        close(conf)
+    }
+    {
+        mt = $1 + 0                         # float epoch mtime
+        p = substr($0, index($0, " ") + 1) # path = everything after first space
+        for (k = 1; k <= n; k++) if (mt > thr[k]) print p >> out[k]
+    }
+'
+
+rm -f "$AWK_CONF"
+
+# Publish atomically + write meta.
+i=0
+while [ "$i" -lt "${#CLIENT_IDS[@]}" ]; do
+    CID="${CLIENT_IDS[$i]}"
+    TMP="${CLIENTS_DIR}/${CID}/sync-manifest.txt.tmp"
+    FINAL="${CLIENTS_DIR}/${CID}/sync-manifest.txt"
+    COUNT=$(wc -l < "$TMP" 2>/dev/null | tr -d ' '); [ -n "$COUNT" ] || COUNT=0
+    mv -f "$TMP" "$FINAL"
+    printf 'generated_at=%s\nwindow_threshold_epoch=%s\nfile_count=%s\n' \
+        "$NOW" "${THRESHOLDS[$i]}" "$COUNT" > "${CLIENTS_DIR}/${CID}/manifest.meta"
+    log "  wrote $FINAL ($COUNT files)"
+    i=$((i+1))
+done
+
+log "Done."
 ```
 
 ### 4.4 File: `cluster-b/scripts/Dockerfile` (CRLF-safe)
@@ -247,14 +289,14 @@ RUN apt-get update && apt-get install -y \
 RUN mkdir -p /mnt/nas-source
 
 COPY entrypoint.sh /entrypoint.sh
-COPY generate-manifest.sh /userapp/scripts/generate-manifest.sh
+COPY generate-manifests.sh /userapp/scripts/generate-manifests.sh
 
 # CRLF-safe: strip carriage returns, set executable
-RUN dos2unix /entrypoint.sh /userapp/scripts/generate-manifest.sh \
-    && chmod +x /entrypoint.sh /userapp/scripts/generate-manifest.sh
+RUN dos2unix /entrypoint.sh /userapp/scripts/generate-manifests.sh \
+    && chmod +x /entrypoint.sh /userapp/scripts/generate-manifests.sh
 
 # Fail build if any CRLF remains
-RUN for f in /entrypoint.sh /userapp/scripts/generate-manifest.sh; do \
+RUN for f in /entrypoint.sh /userapp/scripts/generate-manifests.sh; do \
         if head -1 "$f" | grep -q $'\r'; then \
             echo "ERROR: CRLF in $f" && exit 1; \
         fi; \
@@ -273,7 +315,7 @@ ENTRYPOINT ["/entrypoint.sh"]
 ```bash
 cd cluster-b/scripts
 # Clean local CRLF first (belt and suspenders)
-sed -i 's/\r$//' entrypoint.sh generate-manifest.sh 2>/dev/null || true
+sed -i 's/\r$//' entrypoint.sh generate-manifests.sh 2>/dev/null || true
 
 docker build -t ${REGISTRY}/nas-sync-server:3.14 .
 docker push ${REGISTRY}/nas-sync-server:3.14
@@ -550,7 +592,7 @@ spec:
           containers:
             - name: manifest-gen
               image: your-registry.example.com/nas-sync-server:3.14   # ◄ reuse server image
-              command: ["/bin/bash", "/userapp/scripts/generate-manifest.sh"]
+              command: ["/bin/bash", "/userapp/scripts/generate-manifests.sh"]
               env:
                 - name: SOURCE_PATH
                   value: "/mnt/nas-source"
@@ -1497,7 +1539,7 @@ cluster-b/
 └── scripts/
     ├── Dockerfile                  # 4.4  (CRLF-safe)
     ├── entrypoint.sh              # 4.2
-    └── generate-manifest.sh       # 4.3  (incremental only)
+    └── generate-manifests.sh      # 4.3  (incremental only)
 
 + Patch non-route ingressgateway port 8787 (5.8)
 ```

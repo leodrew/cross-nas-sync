@@ -1722,7 +1722,7 @@ cluster-a/
 | Explicit target NFS PV+PVC | (this request) | ✓ (9A.1) |
 | Manifest state on source NAS (no PVC) | v3.13 | ✓ (§6) |
 | Single-target incremental (one marker) | v3.13 | superseded by multi-target |
-| Multi-target: per-client manifests | v3.14 | ✓ (§6.1, §8.4) |
+| Multi-target: per-client manifests | v3.14 | ✓ (§4.3, §6.1, §8.4) |
 | Stateless lookback window (no markers) | v3.14 | ✓ (§4.3, §6.2) |
 | Single-walk fan-out generator | v3.14 | ✓ (§4.3) |
 | Client registry ConfigMap | v3.14 | ✓ (§6.2) |
@@ -1739,7 +1739,8 @@ The existing single client keeps working; cut it over to the per-client model:
    except the manifest CronJob.
 2. **Create the registry** with your existing client as `nas-a` (§6.2). Pick its lookback
    from its current schedule (2h CronJob → `6`).
-3. **Replace** `cronjob-manifest.yaml` with `cronjob-manifests.yaml` (§6.1) and apply.
+3. **Replace** `cronjob-manifest.yaml` (the old v3.13 single-client file) with
+   `cronjob-manifests.yaml` (§6.1) and apply.
    The generator now writes `.nas-sync-state/clients/nas-a/sync-manifest.txt`.
 4. **Add `CLIENT_ID=nas-a`** to the existing client CronJob (§9A.2) and apply. It now
    fetches the per-client path instead of the old global `.nas-sync-state/sync-manifest.txt`.

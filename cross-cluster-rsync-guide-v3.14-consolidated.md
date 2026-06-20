@@ -564,9 +564,26 @@ kubectl patch svc $INGRESS_SVC -n istio-system --type='json' -p='[
 
 > **Only needed if you use `incremental` mode.** Skip if using `standard` or `parallel`.
 
-### 6.1 cronjob-manifest.yaml
+### 6.1 cronjob-manifests.yaml + client registry
 
 ```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: nas-sync-clients
+  namespace: ea-pmc
+  labels:
+    app: nas-sync
+    role: manifest
+data:
+  clients.txt: |
+    # <client_id>  <lookback_hours>
+    # lookback = client pull period x2-3 (or pull period + worst tolerated outage).
+    # Add one line per target cluster; remove a line to retire a target.
+    nas-a   6
+    nas-c   6
+    nas-d   48
+---
 apiVersion: batch/v1
 kind: CronJob
 metadata:
@@ -576,7 +593,7 @@ metadata:
     app: nas-sync
     role: manifest
 spec:
-  # Run 10 min BEFORE the client incremental sync
+  # Run ~10 min BEFORE the most-frequent client incremental sync.
   schedule: "50 */2 * * *"
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3
@@ -587,7 +604,7 @@ spec:
       template:
         metadata:
           annotations:
-            sidecar.istio.io/inject: "false"   # try; if forced, harmless here
+            sidecar.istio.io/inject: "false"
         spec:
           containers:
             - name: manifest-gen
@@ -596,26 +613,48 @@ spec:
               env:
                 - name: SOURCE_PATH
                   value: "/mnt/nas-source"
-                # State now lives on the source NAS (no PVC). The script default is
-                # ${SOURCE_PATH}/.nas-sync-state; set explicitly here for clarity:
                 - name: STATE_DIR
                   value: "/mnt/nas-source/.nas-sync-state"
+                - name: REGISTRY_FILE
+                  value: "/userapp/config/clients.txt"
               volumeMounts:
                 - name: nas-source
                   mountPath: /mnt/nas-source
+                - name: clients-registry
+                  mountPath: /userapp/config/clients.txt
+                  subPath: clients.txt
+                  readOnly: true
           restartPolicy: Never
           volumes:
             - name: nas-source
               nfs:
                 server: "10.90.220.155"          # ◄ MODIFY
                 path: "/PMCenterData"            # ◄ MODIFY
-                readOnly: false                  # REQUIRED: manifest + state are written here
+                readOnly: false                  # REQUIRED: manifests are written here
+            - name: clients-registry
+              configMap:
+                name: nas-sync-clients
 ```
 
 ```bash
-# Only if using incremental mode:
-kubectl apply -f cluster-b/cronjob-manifest.yaml
+# Only if using incremental mode (applies both the registry ConfigMap and the CronJob):
+kubectl apply -f cluster-b/cronjob-manifests.yaml
 ```
+
+### 6.2 The client registry (`clients.txt`)
+
+The `nas-sync-clients` ConfigMap is the **single source of truth** for which targets
+exist. Each non-comment line is `<client_id> <lookback_hours>`:
+
+- **`client_id`** must match the `CLIENT_ID` env on that target's client (§9A.3). It
+  names the per-client manifest directory `.nas-sync-state/clients/<client_id>/`.
+- **`lookback_hours`** = that client's pull period × 2–3 (e.g. a 2h CronJob → `6`; a
+  daily puller → `48`). The generator emits "files changed in the last N hours", so
+  overlapping windows let a target that misses a cycle catch up on its next run.
+
+Add a target = add a line (then deploy its client, §9A.3). Retire a target = delete its
+line (optionally `rm -rf` its `.nas-sync-state/clients/<id>/` dir on the source NAS).
+The generator does **one** `find` walk regardless of how many clients are listed.
 
 ---
 
@@ -1535,7 +1574,7 @@ cluster-b/
 ├── service.yaml                    # 5.5
 ├── gateway.yaml                    # 5.6  ← MODIFY selector
 ├── virtualservice.yaml             # 5.7
-├── cronjob-manifest.yaml           # 6.1  (incremental only)
+├── cronjob-manifests.yaml          # 6.1  (incremental only; ConfigMap + CronJob)
 └── scripts/
     ├── Dockerfile                  # 4.4  (CRLF-safe)
     ├── entrypoint.sh              # 4.2

@@ -176,7 +176,68 @@ Source-side state is therefore restructured:
 - Status files live on each **target** NAS (§6), so they are per-target by
   construction — no change needed.
 
-## 8. Error-handling summary
+## 8. Multi-target operational scenarios
+
+The guide gains a scenarios section (with the diagrams below) so operators know the
+exact sequence for each situation. The interesting case: **Target B is live and has
+completed its initial sync — how does a new Target C onboard without disturbing it?**
+
+### S1 — Single target (unchanged)
+
+`SYNC_ID=default` everywhere; behavior identical to v3.13/v3.14.
+
+### S2 — Onboarding Target C while Target B is live
+
+Three phases. The ordering matters: the manifest CronJob for `nas-c` is created only
+**after** the bulk completes, so its first-run `FULL_SYNC` sentinel doubles as the
+post-bulk reconcile that catches everything changed *during* the multi-day bulk.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant SB as Source NAS B<br/>(.nas-sync-state/)
+    participant MG as Manifest CronJob<br/>SYNC_ID=nas-c (Cluster B)
+    participant TB as Target B client<br/>SYNC_ID=nas-b (live)
+    participant TC as Target C client<br/>SYNC_ID=nas-c (new)
+
+    Note over TB,SB: Steady state — incremental every 2h,<br/>reads targets/nas-b/ only
+
+    Note over TC: Phase 1 — initial bulk
+    TC->>SB: SYNC_MODE=parallel Deployment pulls full tree<br/>(uses common/chunks/ if fresh, else top-level split)
+    Note over TB,TC: Target B unaffected — no shared write state
+
+    Note over MG: Phase 2 — enable incremental (after bulk completes)
+    MG->>SB: 1st run: no marker → create targets/nas-c/marker,<br/>emit FULL_SYNC manifest
+    TC->>SB: 1st incremental run reads FULL_SYNC → full pass<br/>(doubles as post-bulk reconcile: catches changes<br/>made while the bulk was running)
+
+    Note over TC: Phase 3 — steady state
+    MG->>SB: each cycle: manifest of changes since nas-c marker
+    TC->>SB: incremental pull via targets/nas-c/.sync-manifest.txt
+    TB->>SB: unchanged — independent marker, independent cadence
+```
+
+Operator checklist form: (1) deploy Target C's PV/PVC + bulk `parallel` Deployment;
+(2) wait for bulk completion (status file on Target C's NAS); (3) delete the bulk
+Deployment, create the `nas-c` manifest CronJob and the `nas-c` incremental client
+CronJob; (4) first incremental performs the FULL_SYNC reconcile pass; (5) steady state.
+
+### S3 — Steady state with N targets
+
+Each target has its own manifest CronJob + marker under `targets/<SYNC_ID>/`; all
+share `common/chunks/`. **Stagger weekly reconciles** (different days/hours) so N
+full walks don't hit the source NAS simultaneously.
+
+### S4 — Target misses cycles (honest failure-mode note)
+
+The generator advances a target's marker every run *whether or not the client
+consumed the manifest*. A client outage spanning ≥1 cycle therefore loses those
+manifests' changes until the **weekly reconcile** repairs it — same at-least-once
+semantics as v3.13 single-target. The verify mode (§4) makes the interim drift
+visible; the status file (§6) makes the outage itself visible. Documented in the
+guide so operators know the reconcile is a required compensating control, not an
+optional extra.
+
+## 9. Error-handling summary
 
 Every new path degrades to existing behavior:
 
@@ -189,7 +250,7 @@ Every new path degrades to existing behavior:
 
 No new failure mode can make replication worse than today.
 
-## 9. Guide integration (self-referential bookkeeping)
+## 10. Guide integration (self-referential bookkeeping)
 
 | Artifact | Action |
 |---|---|
@@ -199,6 +260,7 @@ No new failure mode can make replication worse than today.
 | CronJob manifests | New: verify (monthly, Cluster A), chunk generator (weekly, Cluster B); manifest CronJob becomes a per-target template (`SYNC_ID` env); reconcile schedule note updated |
 | §11 test plan | New test entries: verify run, chunked reconcile run, chunk-fallback case, status-file check |
 | §13 troubleshooting | New entries: drift > 0, chunks stale/fallback triggered, status file stale |
+| Multi-target scenarios section | New guide section: S1–S4 scenarios + the S2 onboarding sequence diagram (Mermaid) + operator checklist |
 | §14 File Checklist | All new scripts/manifests listed with section numbers |
 | "What This Consolidates" table | New capability rows tagged v3.15 |
 | Filename/version | Follows whatever v3.14 does at landing; v3.15 additions recorded in the consolidates table either way |
@@ -207,7 +269,7 @@ All new fenced code blocks stay copy-paste-ready: valid shell/YAML, LF endings,
 placeholders (`your-registry.example.com`, `ISTIO_EXTERNAL_IP_HERE`) intact and
 marked `◄ MODIFY`.
 
-## 10. Testing
+## 11. Testing
 
 Per §11 conventions (manual test jobs against real clusters):
 
@@ -227,7 +289,7 @@ Per §11 conventions (manual test jobs against real clusters):
    target 2's next manifest still lists it).
 6. CRLF guard: `head -1` each new script through `cat -A` — expect `#!/bin/bash$`.
 
-## 11. Out of scope
+## 12. Out of scope
 
 - Transit encryption (user confirmed trusted link; if policy changes, TLS at the
   gateway or stunnel is the known path).

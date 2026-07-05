@@ -23,6 +23,10 @@ and address the two stated reliability worries:
 - **Encryption:** the cross-site link is trusted — cleartext rsyncd is acceptable.
 - **Semantics:** one-way (NAS B → NAS A), deletions must never propagate, target-only
   files preserved. Intentional policy, not a deferral.
+- **Multi-target:** the source NAS will feed **multiple target NASes** (multiple
+  clients pulling). Any per-sync state recorded on the source NAS must be isolated
+  per target — a single shared marker/manifest would make a target that misses a
+  cycle silently lose those changes forever.
 
 ## 3. Evaluation verdict: keep the rsync architecture
 
@@ -101,8 +105,10 @@ scheduled ~2h before the client's reconcile (same offset idea as the manifest's 
   relative paths.
 - Splits the list by count into `CHUNK_COUNT` files (default 24 — deliberately more
   chunks than workers so fast workers keep pulling; fpart's core trick):
-  `.nas-sync-state/chunks/chunk-000.txt … chunk-023.txt` + `chunks.meta`
-  (chunk count, total files, generation timestamp).
+  `.nas-sync-state/common/chunks/chunk-000.txt … chunk-023.txt` + `chunks.meta`
+  (chunk count, total files, generation timestamp). Chunks are target-independent
+  (a pure split of the source tree), so they live under `common/` and are **shared
+  by all targets** — one weekly walk serves every reconcile (see §7).
 - Same safety idiom as the manifest generator: write to a temp dir, atomic `mv` into
   place, `concurrencyPolicy: Forbid`, orphan cleanup on start.
 
@@ -142,7 +148,35 @@ writable, already client-excluded, no new mounts or PVCs.
   but any external monitor can poll the file later.
 - A status-write failure logs a warning but never fails the sync.
 
-## 7. Error-handling summary
+## 7. Addition 4 — Multi-target state layout (`SYNC_ID`)
+
+**Attacks:** silent missed changes when one source NAS feeds multiple target NASes.
+
+The manifest marker is *time-window state per target*: if Target 1 syncs a cycle that
+Target 2 misses, a shared marker advances past changes Target 2 never received.
+Source-side state is therefore restructured:
+
+```
+.nas-sync-state/
+├── common/
+│   └── chunks/            ← shared: chunk-000.txt…, chunks.meta (one walk serves all)
+└── targets/
+    └── <SYNC_ID>/         ← per-target: last-sync-marker, .sync-manifest.txt
+```
+
+- **`SYNC_ID` env var** (e.g. `nas-a`, `nas-c`) on both the manifest generator and the
+  client; defaults to `default`, so a single-target deploy needs no extra config.
+- **One manifest CronJob per target** on Cluster B — same `generate-manifest.sh`,
+  different `SYNC_ID` + schedule aligned to that target's client cadence. Each target
+  gets its own marker, so a missed cycle self-heals per target.
+- Client fetches `targets/<SYNC_ID>/.sync-manifest.txt`; falls back to `FULL_SYNC` as
+  today if its manifest is absent.
+- Chunk generation remains a single shared CronJob writing to `common/` (chunks are a
+  pure source-tree split, valid for every target).
+- Status files live on each **target** NAS (§6), so they are per-target by
+  construction — no change needed.
+
+## 8. Error-handling summary
 
 Every new path degrades to existing behavior:
 
@@ -151,16 +185,18 @@ Every new path degrades to existing behavior:
 | Chunk job failed / chunks stale | Reconcile falls back to top-level split (today's behavior) |
 | Verify finds drift | Job exits nonzero — visible, no data touched (dry-run only) |
 | Status file write fails | Warning logged; sync outcome unaffected |
+| Per-target manifest absent (new target, generator not yet run) | Client falls back to `FULL_SYNC` (existing behavior) |
 
 No new failure mode can make replication worse than today.
 
-## 8. Guide integration (self-referential bookkeeping)
+## 9. Guide integration (self-referential bookkeeping)
 
 | Artifact | Action |
 |---|---|
 | `nas-sync-verify.sh`, `generate-chunks.sh` | New sections; added to both Dockerfiles' COPY + dos2unix + CRLF-guard lists |
 | `nas-sync-parallel.sh`, `dispatch-sync.sh` | Updated in place (chunked path + fallback; status-file wrapper) |
-| CronJob manifests | New: verify (monthly, Cluster A), chunk generator (weekly, Cluster B); reconcile schedule note updated |
+| `generate-manifest.sh`, `nas-sync-incremental.sh` | Updated in place: `SYNC_ID`-aware paths (`targets/<SYNC_ID>/`), default `default` |
+| CronJob manifests | New: verify (monthly, Cluster A), chunk generator (weekly, Cluster B); manifest CronJob becomes a per-target template (`SYNC_ID` env); reconcile schedule note updated |
 | §11 test plan | New test entries: verify run, chunked reconcile run, chunk-fallback case, status-file check |
 | §13 troubleshooting | New entries: drift > 0, chunks stale/fallback triggered, status file stale |
 | §14 File Checklist | All new scripts/manifests listed with section numbers |
@@ -171,7 +207,7 @@ All new fenced code blocks stay copy-paste-ready: valid shell/YAML, LF endings,
 placeholders (`your-registry.example.com`, `ISTIO_EXTERNAL_IP_HERE`) intact and
 marked `◄ MODIFY`.
 
-## 9. Testing
+## 10. Testing
 
 Per §11 conventions (manual test jobs against real clusters):
 
@@ -185,9 +221,13 @@ Per §11 conventions (manual test jobs against real clusters):
 4. Status file: after any test job, confirm `.nas-sync-status/last-run` and
    `last-success` exist on NAS A with correct fields; confirm a forced-failure run
    updates `last-run` but not `last-success`.
-5. CRLF guard: `head -1` each new script through `cat -A` — expect `#!/bin/bash$`.
+5. Multi-target isolation: run two manifest generators with different `SYNC_ID`s;
+   confirm independent markers under `targets/<id>/`, and that syncing target 1 does
+   not advance target 2's marker (touch a file, sync target 1 only, then confirm
+   target 2's next manifest still lists it).
+6. CRLF guard: `head -1` each new script through `cat -A` — expect `#!/bin/bash$`.
 
-## 10. Out of scope
+## 11. Out of scope
 
 - Transit encryption (user confirmed trusted link; if policy changes, TLS at the
   gateway or stunnel is the known path).

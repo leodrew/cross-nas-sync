@@ -300,7 +300,7 @@ metadata:
 
 ### 5.2 configmap-rsyncd.yaml
 
-> Note `reverse lookup = no` (fixes the 127.0.0.6 DNS stall) and the optional `[manifest]` module for read-only-NAS setups.
+> Note `reverse lookup = no` (fixes the 127.0.0.6 DNS stall). Only the `[nas-data]` module is needed — incremental mode's manifest + sync-state live on the source NAS under `.nas-sync-state/` (written by the §6 CronJob), not in a separate rsyncd module.
 
 ```yaml
 apiVersion: v1
@@ -388,8 +388,9 @@ spec:
           volumeMounts:
             - name: nas-source
               mountPath: /mnt/nas-source
-              # read-write IF using incremental (manifest written into source).
-              # If NAS B must be read-only, see Step 6 [manifest] module option.
+              # Must be read-write for incremental: the manifest + sync-state are
+              # written into the source NAS under .nas-sync-state/ (§6). standard
+              # and parallel modes can run against a read-only source.
             - name: rsyncd-config
               mountPath: /etc/rsyncd.conf
               subPath: rsyncd.conf

@@ -1,5 +1,22 @@
 # v3.15 Guide Hardening Implementation Plan
 
+> ## ⚠ SUPERSEDED — 2026-07-22. DO NOT EXECUTE.
+>
+> This plan targets `cross-cluster-rsync-guide-v3.13-consolidated.md` and assumes v3.13's
+> marker-based state model. **v3.14 had already shipped a different multi-target design**
+> (`CLIENT_ID` + registry ConfigMap + stateless lookback window), which makes Task 1
+> (`SYNC_ID` state layout) unnecessary and its edits incompatible with the current guide.
+> Task 0 also mis-identifies which guide file held the pending edit.
+>
+> **What shipped instead:** `cross-cluster-rsync-guide-v3.15-consolidated.md`, rebased onto
+> v3.14 — verify mode, chunked reconcile, status file, the reconcile manifest, plus twelve
+> defect fixes found during review. See:
+> - `docs/reviews/2026-07-22-nas-sync-architecture-review.md` — findings and rationale
+> - `docs/nas-sync-operations-runbook.md` — the operational scenarios this plan's Task 7 sketched
+>
+> Kept for provenance. Its `extract_block` helper (Global Constraints, below) lives on in
+> `scripts/check-guide.sh`.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Add four hardening capabilities (verify mode, chunked parallel reconcile, sync status file, SYNC_ID multi-target state layout) plus a multi-target scenarios section to `cross-cluster-rsync-guide-v3.13-consolidated.md`, per the approved spec `docs/superpowers/specs/2026-07-05-rsync-hardening-v315-design.md`.

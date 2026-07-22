@@ -1,7 +1,27 @@
 # v3.15 Design — Validate & Harden the Cross-Cluster Rsync Approach
 
+> ## ⚠ SUPERSEDED — 2026-07-22
+>
+> **Delivered, but rebased.** This spec was written against **v3.13's** marker-based state
+> model and targets the v3.13 filename. By the time it was implemented, **v3.14** had shipped a
+> different multi-target design (`CLIENT_ID` + a `clients.txt` registry ConfigMap + a stateless
+> lookback window, no marker files). The two are incompatible, so the spec was rebased onto
+> v3.14 rather than executed as written:
+>
+> | This spec | Outcome |
+> |---|---|
+> | §3 alternatives analysis | **Still authoritative.** Cited by the review; not re-researched. |
+> | §4 Addition 1 — verify mode | **Delivered** as guide §8.10 + §9A.5 |
+> | §5 Addition 2 — chunked reconcile | **Delivered** as guide §4.6 + §6.3 + §8.3 |
+> | §6 Addition 3 — status file | **Delivered** as guide §8.5 |
+> | §7 Addition 4 — `SYNC_ID` per-target markers | **Dropped — superseded** by v3.14's registry, which solves the same problem with no source-side write state, one walk for all targets, and a tunable overlap window. Rationale: review §5. |
+> | §8 scenarios S1–S4 | **Delivered and expanded** as `docs/nas-sync-operations-runbook.md` (S0–S14) |
+>
+> Read `docs/reviews/2026-07-22-nas-sync-architecture-review.md` for what actually shipped.
+> Kept for its alternatives research and design rationale — do not implement from it directly.
+
 **Date:** 2026-07-05
-**Status:** Approved (brainstorming complete; pending implementation plan)
+**Status:** Superseded 2026-07-22 — see the banner above
 **Target:** `cross-cluster-rsync-guide-v3.13-consolidated.md` (layered after the in-flight v3.14 work lands)
 
 ## 1. Motivation

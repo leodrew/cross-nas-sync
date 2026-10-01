@@ -1017,12 +1017,13 @@ exit $SYNC_EXIT
 ```bash
 #!/bin/bash
 #############################################
-# NAS Sync — PARALLEL mode (v3.15)
+# NAS Sync — PARALLEL mode (v3.16)
 # Preferred: N workers over server-generated
 #   equal-count chunk lists (§4.6 / §6.3)
 # Fallback:  N workers split by top-level folder
-#   (v3.14 behavior) when chunks are missing or
-#   stale — a failed chunk job never blocks a run.
+#   when chunks are missing, stale or not one
+#   consistent generation — a failed chunk job
+#   never blocks a run.
 #############################################
 set +e
 
@@ -1041,16 +1042,24 @@ PREFLIGHT_WAIT="${PREFLIGHT_WAIT:-6}"
 # Chunk CronJob runs weekly ~2h before the reconcile, so 24h is ample headroom.
 CHUNK_MAX_AGE="${CHUNK_MAX_AGE:-86400}"
 CHUNKS_REMOTE="${CHUNKS_REMOTE:-.nas-sync-state/common/chunks}"
+# v3.16: a fetch that overlaps the server's swap fails with rc 24 (§4.6). Wait, refetch once.
+CHUNK_RETRY_WAIT="${CHUNK_RETRY_WAIT:-30}"
 
 WORK_DIR="/tmp/nas-sync-parallel.$$"
-FOLDER_LIST="${WORK_DIR}/folders.txt"
+NAMES_BIN="${WORK_DIR}/names.bin"      # top-level names, NUL-terminated
+FOLDER_LIST="${WORK_DIR}/folders.bin"  # "index\0name\0" pairs for the workers
 CHUNK_DIR="${WORK_DIR}/chunks"
-RC_DIR="${WORK_DIR}/rc"
+RC_DIR="${WORK_DIR}/rc"                # one rc file per unit — nothing else in here
+NAME_DIR="${WORK_DIR}/names"           # folder name per index, for the failure report
 REMOTE_URL="rsync://${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PORT}/${REMOTE_MODULE}"
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"; }
 log_error() { echo "$(date '+%Y-%m-%d %H:%M:%S') - ERROR: $1" >&2; }
 die() { log_error "$1"; exit "${2:-1}"; }
+
+# v3.16: shared helpers (§8.11). On SIGTERM, let rsync save its partial, then stop.
+. "$(dirname "${BASH_SOURCE[0]}")/nas-sync-lib.sh" || die "nas-sync-lib.sh not found (§8.11)"
+term_trap_install
 
 # rsync 23/24 are normal on a live source — see §8.2.
 rsync_rc_ok() {
@@ -1069,6 +1078,7 @@ wait_for_remote() {
         nc -z -w 10 "$REMOTE_HOST" "$REMOTE_PORT" 2>/dev/null && return 0
         log "Remote not reachable yet (attempt ${i}/${PREFLIGHT_RETRIES}) — sidecar may still be starting"
         sleep "$PREFLIGHT_WAIT"
+        check_term
         i=$((i+1))
     done
     return 1
@@ -1080,7 +1090,7 @@ RSYNC_FLAGS="$RSYNC_FLAGS --password-file=$RSYNC_PASSWORD_FILE"
 [ -f "$EXCLUDE_FILE" ] && RSYNC_FLAGS="$RSYNC_FLAGS --exclude-from=$EXCLUDE_FILE"
 
 trap 'rm -rf "$WORK_DIR"' EXIT
-mkdir -p "$CHUNK_DIR" "$RC_DIR" || die "Cannot create $WORK_DIR"
+mkdir -p "$CHUNK_DIR" "$RC_DIR" "$NAME_DIR" || die "Cannot create $WORK_DIR"
 
 START=$(date +%s)
 log "=== NAS SYNC (parallel, $PARALLEL_WORKERS workers) ==="
@@ -1090,7 +1100,7 @@ wait_for_remote || die "Remote not reachable after ${PREFLIGHT_RETRIES} attempts
 timeout 10 mountpoint -q "$LOCAL_NAS_PATH" 2>/dev/null || die "Local NAS not mounted"
 log "OK Pre-flight"
 
-export REMOTE_URL LOCAL_NAS_PATH RSYNC_FLAGS CHUNK_DIR RC_DIR
+export REMOTE_URL LOCAL_NAS_PATH RSYNC_FLAGS CHUNK_DIR RC_DIR NAME_DIR
 
 # ---- Worker: one server-generated chunk list ----
 sync_one_chunk() {
@@ -1106,78 +1116,162 @@ sync_one_chunk() {
 export -f sync_one_chunk
 
 # ---- Worker: one top-level folder (fallback path) ----
+# v3.16: the name travels via --files-from --from0, never inside a remote path. The daemon
+# glob-expands remote paths (a folder named "a[1]" was served from "a1"), and a name may hold
+# spaces, quotes, CJK or a newline. -r is explicit: -a does not imply it under --files-from.
 sync_one_folder() {
-    local folder="$1"
+    local idx="$1" name="$2"
     local s; s=$(date +%s)
-    echo "$(date '+%H:%M:%S') [worker] START $folder"
-    rsync $RSYNC_FLAGS "${REMOTE_URL}/${folder}/" "${LOCAL_NAS_PATH}/${folder}/" 2>&1 | sed "s/^/[$folder] /"
-    local rc=${PIPESTATUS[0]}
-    echo "$rc" > "${RC_DIR}/$(echo "$folder" | tr '/' '_')"
-    echo "$(date '+%H:%M:%S') [worker] DONE  $folder (rc=$rc, $(( $(date +%s) - s ))s)"
+    printf '%s\0' "$name" > "${NAME_DIR}/folder-${idx}"
+    echo "$(date '+%H:%M:%S') [worker] START folder#${idx} $(printf '%q' "$name")"
+    printf '%s\0' "$name" \
+        | rsync $RSYNC_FLAGS -r --from0 --files-from=- "${REMOTE_URL}/" "${LOCAL_NAS_PATH}/" 2>&1 \
+        | awk -v p="[folder#${idx}] " '{ print p $0; fflush() }'
+    local rc=${PIPESTATUS[1]}
+    echo "$rc" > "${RC_DIR}/folder-${idx}"
+    echo "$(date '+%H:%M:%S') [worker] DONE  folder#${idx} (rc=$rc, $(( $(date +%s) - s ))s)"
 }
 export -f sync_one_folder
 
 # ---- Try the chunked path (server-generated equal-count chunks, §4.6) ----
-USE_CHUNKS=false
-log "Fetching chunk lists from ${CHUNKS_REMOTE}/ ..."
-rsync -a --password-file="$RSYNC_PASSWORD_FILE" \
-    "${REMOTE_URL}/${CHUNKS_REMOTE}/" "${CHUNK_DIR}/" >/dev/null 2>&1
-FETCH_RC=$?
-
-if [ "$FETCH_RC" -ne 0 ] || [ ! -f "${CHUNK_DIR}/chunks.meta" ]; then
-    log "No chunk lists available (rc=$FETCH_RC) — falling back to top-level split"
-else
-    GEN_AT=$(awk -F= '/^generated_at=/{print $2}' "${CHUNK_DIR}/chunks.meta")
-    case "$GEN_AT" in ''|*[!0-9]*) GEN_AT=0 ;; esac
-    AGE=$(( $(date +%s) - GEN_AT ))
-    if [ "$GEN_AT" -eq 0 ] || [ "$AGE" -gt "$CHUNK_MAX_AGE" ]; then
-        log "Chunks are stale (age=${AGE}s > ${CHUNK_MAX_AGE}s) — falling back to top-level split"
+# v3.16: accept a fetched set only if it is ONE complete generation. The server names every
+# file chunk-<generation>-NNN.txt, so a fetch that overlaps its swap fails (rc 24) instead
+# of silently mixing two generations — a mixed set left ~22% of the tree unreconciled.
+# Returns 0 = usable set, 1 = unusable (fall back), 2 = inconsistent (worth one retry).
+fetch_chunks() {
+    local rc meta="${CHUNK_DIR}/chunks.meta" gen_at count n_all
+    rm -rf "$CHUNK_DIR"; mkdir -p "$CHUNK_DIR"
+    rsync -a --password-file="$RSYNC_PASSWORD_FILE" \
+        "${REMOTE_URL}/${CHUNKS_REMOTE}/" "${CHUNK_DIR}/" >/dev/null 2>&1
+    rc=$?
+    check_term
+    if [ "$rc" -eq 24 ]; then
+        CHUNK_REASON="Chunk files vanished mid-fetch (rc=24) — the server is publishing a new generation"
+        return 2
+    fi
+    if [ "$rc" -ne 0 ] || [ ! -f "$meta" ]; then
+        CHUNK_REASON="No chunk lists available (rc=$rc)"
+        return 1
+    fi
+    gen_at=$(awk -F= '/^generated_at=/{print $2}' "$meta")
+    case "$gen_at" in ''|*[!0-9]*) gen_at=0 ;; esac
+    AGE=$(( $(date +%s) - gen_at ))
+    if [ "$gen_at" -eq 0 ] || [ "$AGE" -gt "$CHUNK_MAX_AGE" ]; then
+        CHUNK_REASON="Chunks are stale (age=${AGE}s > ${CHUNK_MAX_AGE}s)"
+        return 1
+    fi
+    CHUNK_GEN=$(awk -F= '/^generation=/{print $2}' "$meta")
+    count=$(awk -F= '/^chunk_count=/{print $2}' "$meta")
+    TOTAL_FILES=$(awk -F= '/^total_files=/{print $2}' "$meta")
+    n_all=$(find "$CHUNK_DIR" -maxdepth 1 -name 'chunk-*.txt' | wc -l | tr -d ' ')
+    if [ -z "$CHUNK_GEN" ]; then
+        # Only after a rollback to a v3.15 server: same acceptance rule as v3.15.
+        log "WARN: chunks.meta has no generation (v3.15 server) — cannot prove the set is one generation"
+        CHUNK_GLOB='chunk-*.txt'
+        NCHUNK=$n_all
     else
-        NCHUNK=$(ls -1 "${CHUNK_DIR}"/chunk-*.txt 2>/dev/null | wc -l | tr -d ' ')
-        if [ "$NCHUNK" -gt 0 ]; then
-            USE_CHUNKS=true
-            log "Using $NCHUNK server-generated chunks (age=${AGE}s, $(awk -F= '/^total_files=/{print $2}' "${CHUNK_DIR}/chunks.meta") files total)"
-        else
-            log "chunks.meta present but no chunk-*.txt — falling back to top-level split"
+        CHUNK_GLOB="chunk-${CHUNK_GEN}-*.txt"
+        NCHUNK=$(find "$CHUNK_DIR" -maxdepth 1 -name "$CHUNK_GLOB" | wc -l | tr -d ' ')
+        if [ "$NCHUNK" != "$count" ] || [ "$n_all" != "$NCHUNK" ]; then
+            CHUNK_REASON="Chunk set inconsistent (generation ${CHUNK_GEN}: ${NCHUNK} of ${count:-?} chunks, ${n_all} chunk files in total)"
+            return 2
         fi
     fi
+    if [ "$NCHUNK" -eq 0 ]; then
+        CHUNK_REASON="chunks.meta present but no chunk files"
+        return 1
+    fi
+    return 0
+}
+
+USE_CHUNKS=false
+log "Fetching chunk lists from ${CHUNKS_REMOTE}/ ..."
+fetch_chunks; CS=$?
+if [ "$CS" -eq 2 ]; then
+    log "$CHUNK_REASON — retrying once in ${CHUNK_RETRY_WAIT}s"
+    sleep "$CHUNK_RETRY_WAIT"
+    check_term
+    fetch_chunks; CS=$?
+fi
+if [ "$CS" -eq 0 ]; then
+    USE_CHUNKS=true
+    log "Using $NCHUNK server-generated chunks (generation=${CHUNK_GEN:-none}, age=${AGE}s, ${TOTAL_FILES:-?} files total)"
+else
+    log "$CHUNK_REASON — falling back to top-level split"
 fi
 
 if [ "$USE_CHUNKS" = true ]; then
     UNIT="chunks"
     UNIT_COUNT="$NCHUNK"
-    ls -1 "${CHUNK_DIR}"/chunk-*.txt \
-        | xargs -P "$PARALLEL_WORKERS" -I {} bash -c 'sync_one_chunk "$@"' _ {}
+    EXPECTED_RC="$NCHUNK"
+    # xargs ignores SIGTERM so it waits for every worker; each rsync still handles SIGTERM
+    # itself and saves its partial (§8.11). -0 so no character in a path is special.
+    find "$CHUNK_DIR" -maxdepth 1 -name "$CHUNK_GLOB" -print0 | sort -z \
+        | ( trap '' TERM; exec xargs -0 -n 1 -P "$PARALLEL_WORKERS" bash -c 'sync_one_chunk "$1"' _ )
+    XARGS_RC=${PIPESTATUS[2]}
 else
     UNIT="folders"
     log "Listing top-level folders..."
-    rsync --list-only --password-file="$RSYNC_PASSWORD_FILE" "${REMOTE_URL}/" 2>/dev/null \
-        | awk '$1 ~ /^d/ && $NF != "." {print $NF}' > "$FOLDER_LIST"
-    UNIT_COUNT=$(wc -l < "$FOLDER_LIST" | tr -d ' ')
+    list_top_dirs > "$NAMES_BIN"
+    LIST_RC=$?
+    check_term
+    [ "$LIST_RC" -eq 0 ] || die "Cannot list top-level folders (rsync rc=$LIST_RC)"
+    UNIT_COUNT=$(tr -cd '\0' < "$NAMES_BIN" | wc -c | tr -d ' ')
     log "Found $UNIT_COUNT top-level folders"
     [ "$UNIT_COUNT" -gt 0 ] || die "No folders found"
 
+    # v3.16: --no-recursive. -a implies -r, so v3.15's "-a --dirs" copied the WHOLE tree here,
+    # serially, before any worker started. This pass owns the top level only: loose files,
+    # symlinks, and the top-level directories themselves (empty; workers fill them).
     log "Syncing top-level loose files..."
-    rsync $RSYNC_FLAGS --dirs "${REMOTE_URL}/" "${LOCAL_NAS_PATH}/" 2>&1 | grep -v '^$'
+    rsync $RSYNC_FLAGS --no-recursive --dirs "${REMOTE_URL}/" "${LOCAL_NAS_PATH}/" 2>&1 | grep -v '^$'
+    echo "${PIPESTATUS[0]}" > "${RC_DIR}/loose"
+    check_term
+    EXPECTED_RC=$(( UNIT_COUNT + 1 ))
 
-    xargs -P "$PARALLEL_WORKERS" -I {} bash -c 'sync_one_folder "$@"' _ {} < "$FOLDER_LIST"
+    i=0
+    while IFS= read -r -d '' n; do
+        i=$((i+1))
+        printf '%s\0%s\0' "$i" "$n"
+    done < "$NAMES_BIN" > "$FOLDER_LIST"
+    ( trap '' TERM; exec xargs -0 -n 2 -P "$PARALLEL_WORKERS" bash -c 'sync_one_folder "$1" "$2"' _ ) < "$FOLDER_LIST"
+    XARGS_RC=$?
 fi
 
 # ---- Tally worker results: one bad worker must not hide the others ----
 FAILED=""
 FAIL_COUNT=0
+RC_COUNT=0
 for f in "${RC_DIR}"/*; do
     [ -f "$f" ] || continue
+    RC_COUNT=$((RC_COUNT+1))
     rc=$(cat "$f")
     if ! rsync_rc_ok "$rc"; then
-        FAILED="$FAILED $(basename "$f")(rc=$rc)"
+        u=$(basename "$f")
+        if [ -f "${NAME_DIR}/$u" ]; then
+            IFS= read -r -d '' n < "${NAME_DIR}/$u"
+            u="$u=$(printf '%q' "$n")"
+        fi
+        FAILED="$FAILED ${u}(rc=$rc)"
         FAIL_COUNT=$((FAIL_COUNT+1))
     fi
 done
+# v3.16: prove every unit ran. v3.15 trusted the rc files alone, so an xargs that stopped
+# early (it did, on a folder name containing a quote) still ended "all OK".
+if [ "$XARGS_RC" -ne 0 ]; then
+    FAILED="$FAILED xargs(rc=$XARGS_RC)"
+    FAIL_COUNT=$((FAIL_COUNT+1))
+fi
+if [ "$RC_COUNT" -ne "$EXPECTED_RC" ]; then
+    FAILED="$FAILED only-${RC_COUNT}-of-${EXPECTED_RC}-units-reported"
+    FAIL_COUNT=$((FAIL_COUNT+1))
+fi
+
+check_term
 
 DUR=$(( $(date +%s) - START ))
 if [ "$FAIL_COUNT" -gt 0 ]; then
-    log_error "$FAIL_COUNT/$UNIT_COUNT $UNIT failed:$FAILED"
+    log_error "$FAIL_COUNT problem(s) across $UNIT_COUNT $UNIT:$FAILED"
     log "=== COMPLETE: $UNIT_COUNT $UNIT, ${DUR}s, FAILED=$FAIL_COUNT ==="
     exit 1
 fi
@@ -1573,10 +1667,12 @@ RUN apt-get update && apt-get install -y \
 # Verify required tools (fail build if missing)
 # v3.15 adds flock (util-linux) — the Deployment cron loop's overlap guard (§8.7)
 # and cksum (coreutils) — the verify slice hash (§8.10).
+# v3.16 adds perl (perl-base, Essential in ubuntu:24.04) — the folder-name decoder (§8.11).
 RUN command -v rsync && command -v curl && command -v wget \
     && command -v nc && command -v bash && command -v tini \
     && command -v dos2unix && command -v xargs \
-    && command -v flock && command -v cksum
+    && command -v flock && command -v cksum \
+    && command -v perl
 
 RUN mkdir -p /userapp/scripts /userapp/config /mnt/nas-target
 
@@ -1587,6 +1683,7 @@ COPY nas-sync-verify.sh         /userapp/scripts/
 COPY dispatch-sync.sh           /userapp/scripts/
 COPY run-with-sidecar-quit.sh   /userapp/scripts/
 COPY entrypoint-deployment.sh   /userapp/scripts/
+COPY nas-sync-lib.sh            /userapp/scripts/
 
 # CRLF-safe: strip carriage returns, set executable
 RUN dos2unix /userapp/scripts/*.sh \
@@ -1644,7 +1741,7 @@ docker push ${REGISTRY}/nas-sync-client:3.16
 
 # Sanity check
 docker run --rm ${REGISTRY}/nas-sync-client:3.16 sh -c \
-  "ls /userapp/scripts/ && which curl wget nc bash tini xargs flock && echo OK"
+  "ls /userapp/scripts/ && which curl wget nc bash tini xargs flock perl && echo OK"
 ```
 
 ### 8.10 File: `cluster-a/scripts/nas-sync-verify.sh` (v3.15)
@@ -1804,6 +1901,88 @@ exit 0
 > **Expect some baseline drift** from the exclude list (§9A.1). Anything excluded from the
 > sync but not from verify shows up as a difference. Both use the same `EXCLUDE_FILE`, so
 > they agree by default — if you diverge them, raise `VERIFY_FAIL_THRESHOLD` accordingly.
+
+### 8.11 File: `cluster-a/scripts/nas-sync-lib.sh` (v3.16)
+
+> Write this file **before** running §8.9 — it is in the Dockerfile's COPY list (§8.8), and
+> every client script sources it. Section order is kept stable; build order is §8.10, §8.11,
+> then §8.9.
+>
+> Holds only the helpers v3.16 introduced: a top-level folder lister that survives any
+> character in a name (§8.3 fallback, §8.10 tier 2), and the pieces of graceful shutdown.
+
+```bash
+#!/bin/bash
+#############################################
+# NAS Sync client library — v3.16
+# Sourced by every client script. Holds ONLY
+# the helpers v3.16 introduced:
+#   list_top_dirs      top-level dir names, NUL-terminated
+#   wait_child         wait that survives trap interrupts
+#   term_trap_install  on SIGTERM: let rsync finish, then stop
+#   check_term         exit 143 once SIGTERM has arrived
+# Caller provides: log(); for list_top_dirs also
+# REMOTE_URL, RSYNC_PASSWORD_FILE, EXCLUDE_FILE.
+#############################################
+
+# Top-level directory names of the remote module, each terminated by NUL, on stdout.
+# Returns rsync's rc. Why not `awk '{print $NF}'` (v3.15): it cut names at the last space;
+# --list-only escapes non-ASCII bytes as \#ooo unless -8 is given; and any name passed as
+# part of a REMOTE PATH is glob-expanded by the daemon ("a[1]/" is served from "a1").
+# Callers must therefore transfer these names with --files-from --from0, never in a path.
+# The same exclude file as the sync is applied here, so .nas-sync-state/ and friends are
+# filtered with identical semantics (names given explicitly to --files-from bypass excludes).
+list_top_dirs() {
+    local out rc
+    local args=(--list-only -8 --password-file="$RSYNC_PASSWORD_FILE")
+    [ -f "$EXCLUDE_FILE" ] && args+=(--exclude-from="$EXCLUDE_FILE")
+    out=$(mktemp) || return 1
+    rsync "${args[@]}" "${REMOTE_URL}/" > "$out"
+    rc=$?
+    # Line format: perms, size, YYYY/MM/DD, HH:MM:SS, name. The name is everything after
+    # the time, so spaces, leading spaces and tabs survive. MOTD lines never match.
+    # -8 still escapes control characters (a newline in a name is \#012): decode only
+    # \#ooo — printf %b would also turn a literal "\n" inside a name into a newline.
+    sed -n 's/^d[^ ]* \{1,\}[0-9,.]\{1,\} [0-9]\{4\}\/[0-9]\{2\}\/[0-9]\{2\} [0-9]\{2\}:[0-9]\{2\}:[0-9]\{2\} //p' "$out" \
+        | grep -vx '\.' \
+        | perl -ne 'chomp; s/\\#([0-7]{3})/chr(oct($1))/ge; print "$_\0"'
+    rm -f "$out"
+    return "$rc"
+}
+
+# wait_child <pid>: sets WAIT_RC to the child's real exit status. A trapped signal makes
+# `wait` return early (>128) while the child is still running — keep waiting until it is
+# gone. A shell that exits before its children unwinds the chain up to tini (PID 1), and
+# the kernel then SIGKILLs rsync before it can save its partial file.
+wait_child() {
+    local r
+    while :; do
+        wait "$1"; r=$?
+        [ "$r" -le 128 ] && { WAIT_RC=$r; return; }
+        kill -0 "$1" 2>/dev/null || { WAIT_RC=$r; return; }
+    done
+}
+
+# Mode scripts: on SIGTERM only set a flag. bash runs the trap AFTER the foreground rsync
+# exits, so rsync (which receives SIGTERM itself) moves its partial file into
+# .rsync-partial/ first. check_term then stops before the next step.
+TERMINATING=""
+term_trap_install() { trap 'TERMINATING=1' TERM INT; }
+check_term() {
+    [ -n "$TERMINATING" ] || return 0
+    log "Interrupted (SIGTERM) — stopping after the current step"
+    exit 143
+}
+```
+
+> **Shutdown model (v3.16).** One place sends SIGTERM; every shell that has children waits
+> for them. The CronJob wrapper (§8.6) signals its own process group; the Deployment
+> entrypoint (§8.7) signals each run's process group (cron gives every job its own session).
+> The dispatcher (§8.5) and the mode scripts only wait, so rsync — which handles SIGTERM
+> itself — moves its partial file into `.rsync-partial/` before anything exits, and the status
+> file records `interrupted=TERM`. In v3.15 the wrapper died first, tini (PID 1) exited, and
+> the kernel SIGKILLed rsync, leaving a `.<name>.XXXXXX` temp file in the target tree that no
+> later run removes — the sync runs without --delete.
 
 ---
 
@@ -2796,7 +2975,8 @@ cluster-a/
     ├── nas-sync-verify.sh         # 8.10 (v3.15, verify — dry-run only)
     ├── dispatch-sync.sh           # 8.5  (mode selector + status file)
     ├── run-with-sidecar-quit.sh   # 8.6  (CronJob wrapper)
-    └── entrypoint-deployment.sh   # 8.7  (Deployment entry)
+    ├── entrypoint-deployment.sh   # 8.7  (Deployment entry)
+    └── nas-sync-lib.sh            # 8.11 (v3.16, shared helpers — sourced by every script)
 ```
 
 ### Deploy Order

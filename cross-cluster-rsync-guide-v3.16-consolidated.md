@@ -1055,6 +1055,11 @@ CHUNK_LIST="${WORK_DIR}/chunks.bin"    # sorted chunk paths, NUL-terminated (out
 STOP_FILE="${WORK_DIR}/stop"           # created by the SIGTERM trap (§8.11): queued units must not start
 REMOTE_URL="rsync://${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PORT}/${REMOTE_MODULE}"
 
+# v3.16: folder names are raw bytes, not characters. bash 5.2 `read -d ''` under a UTF-8 locale
+# silently loses the record after a name that ends in a UTF-8 lead byte (legacy Big5/MS950 names
+# often do). C is also the image's default locale, so this only makes it explicit.
+export LC_ALL=C
+
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"; }
 log_error() { echo "$(date '+%Y-%m-%d %H:%M:%S') - ERROR: $1" >&2; }
 die() { log_error "$1"; exit "${2:-1}"; }
@@ -1141,6 +1146,7 @@ sync_one_folder() {
     local s; s=$(date +%s)
     printf '%s\0' "$name" > "${NAME_DIR}/folder-${idx}"
     echo "$(date '+%H:%M:%S') [worker] START folder#${idx} $(printf '%q' "$name")"
+    # Keep --from0 AFTER $RSYNC_FLAGS: they hold --exclude-from, and a --from0 parsed before it makes rsync read the exclude file NUL-delimited, so no exclude applies.
     printf '%s\0' "$name" \
         | rsync $RSYNC_FLAGS -r --from0 --files-from=- "${REMOTE_URL}/" "${LOCAL_NAS_PATH}/" 2>&1 \
         | awk -v p="[folder#${idx}] " '{ print p $0; fflush() }'
@@ -1812,6 +1818,11 @@ VERIFY_FAIL_THRESHOLD="${VERIFY_FAIL_THRESHOLD:-0}"
 REMOTE_URL="rsync://${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PORT}/${REMOTE_MODULE}"
 WORK_DIR="/tmp/nas-sync-verify.$$"
 
+# v3.16: folder names are raw bytes, not characters. bash 5.2 `read -d ''` under a UTF-8 locale
+# silently loses the record after a name that ends in a UTF-8 lead byte (legacy Big5/MS950 names
+# often do). C is also the image's default locale, so this only makes it explicit.
+export LC_ALL=C
+
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"; }
 log_error() { echo "$(date '+%Y-%m-%d %H:%M:%S') - ERROR: $1" >&2; }
 die() { log_error "$1"; exit "${2:-1}"; }
@@ -1858,6 +1869,7 @@ CHECKED_TOTAL=0
 # ---- Tier 1: metadata verify (size + mtime) over the whole tree ----
 if [ "$VERIFY_MODE" = "meta" ] || [ "$VERIFY_MODE" = "both" ]; then
     log "Tier 1: metadata verify (size+mtime), whole tree..."
+    check_term
     rsync $BASE_FLAGS "${REMOTE_URL}/" "${LOCAL_NAS_PATH}/" > "${WORK_DIR}/meta.out" 2>"${WORK_DIR}/meta.err"
     RC=$?
     check_term
@@ -1887,6 +1899,10 @@ if [ "$VERIFY_MODE" = "checksum" ] || [ "$VERIFY_MODE" = "both" ]; then
     check_term
     [ "$LIST_RC" -eq 0 ] || die "Tier 2: cannot list top-level dirs (rsync rc=$LIST_RC)" "$LIST_RC"
 
+    # An empty slice is legitimate; an empty top-level list is not (cf. "No folders found", §8.3).
+    NTOP_NUL=$(tr -cd '\0' < "${WORK_DIR}/topdirs.bin" | wc -c | tr -d ' ')
+    [ "$NTOP_NUL" -gt 0 ] || die "Tier 2: no top-level dirs listed"
+
     : > "${WORK_DIR}/slice.bin"
     NTOP=0
     while IFS= read -r -d '' d; do
@@ -1894,15 +1910,20 @@ if [ "$VERIFY_MODE" = "checksum" ] || [ "$VERIFY_MODE" = "both" ]; then
         H=$(printf '%s' "$d" | cksum | cut -d' ' -f1)
         [ $(( H % VERIFY_SLICES )) -eq "$SLICE" ] && printf '%s\0' "$d" >> "${WORK_DIR}/slice.bin"
     done < "${WORK_DIR}/topdirs.bin"
+    # Reconcile: every listed name must have been read. A lost record is a dir never byte-checked.
+    [ "$NTOP" -eq "$NTOP_NUL" ] || die "Tier 2: read $NTOP of $NTOP_NUL listed top-level dirs — a name was lost while parsing the list"
 
     SLICE_N=$(tr -cd '\0' < "${WORK_DIR}/slice.bin" | wc -c | tr -d ' ')
     log "Tier 2: $SLICE_N of $NTOP top-level dirs in this slice"
 
-    CK_DRIFT=0; CK_CHECKED=0
+    CK_DRIFT=0; CK_CHECKED=0; CK_N=0
     while IFS= read -r -d '' d; do
+        check_term
+        CK_N=$((CK_N+1))
         # v3.16: the name goes through --files-from --from0, never into a remote path (the
         # daemon glob-expands paths: "a[1]" was compared against "a1"). Errors are no longer
         # discarded — a check that silently compares nothing is worse than a failed one.
+        # Keep --from0 AFTER $BASE_FLAGS: they hold --exclude-from, and a --from0 parsed before it makes rsync read the exclude file NUL-delimited, so no exclude applies.
         printf '%s\0' "$d" \
             | rsync $BASE_FLAGS --checksum -r --from0 --files-from=- "${REMOTE_URL}/" "${LOCAL_NAS_PATH}/" \
                 > "${WORK_DIR}/ck.out" 2> "${WORK_DIR}/ck.err"
@@ -1921,6 +1942,7 @@ if [ "$VERIFY_MODE" = "checksum" ] || [ "$VERIFY_MODE" = "both" ]; then
         CK_DRIFT=$(( CK_DRIFT + n ))
         CK_CHECKED=$(( CK_CHECKED + c ))
     done < "${WORK_DIR}/slice.bin"
+    [ "$CK_N" -eq "$SLICE_N" ] || die "Tier 2: checked $CK_N of $SLICE_N dirs in this slice — a name was lost while parsing the slice"
 
     log "Tier 2: drift=$CK_DRIFT of $CK_CHECKED entries compared"
     DRIFT_TOTAL=$(( DRIFT_TOTAL + CK_DRIFT ))

@@ -210,6 +210,8 @@ stay where they are, because moving them is unrelated refactoring.
   `printf '%s\0' "$name" | rsync $RSYNC_FLAGS -r --from0 --files-from=- "${REMOTE_URL}/" "${LOCAL_NAS_PATH}/"`.
   - The name is never part of a remote path, so it is never glob-expanded (F4d).
   - `-r` must be explicit, because `-a` does not imply it under `--files-from`.
+- The script runs with `export LC_ALL=C`, because names are raw bytes and bash 5.2 `read -d ''` under a UTF-8 locale
+  silently loses the record that follows a name ending in a UTF-8 lead byte (legacy Big5/MS950 names often do).
 
 **Bookkeeping**
 - Each worker writes its rc to `rc/folder-<index>` and its name to `names/folder-<index>` (`NAME_DIR`, a separate
@@ -231,6 +233,9 @@ Either failing is a run failure. This catches xargs stopping partway (F4c).
 - Each slice directory is compared with
   `printf '%s\0' "$d" | rsync $BASE_FLAGS --checksum -r --from0 --files-from=- "${REMOTE_URL}/" "${LOCAL_NAS_PATH}/"`.
 - stderr goes to a file instead of `/dev/null`.
+- The script runs with `export LC_ALL=C` (see §5.2), and tier 2 reconciles counts: the names read from the list must
+  equal the NUL count of the list file (which must be non-zero), and the dirs checked must equal the slice size —
+  any mismatch is a `die`.
 - **rc handling:**
   - Any rc outside {0, 23, 24} fails the run, printing the first lines of stderr.
   - rc 23 is logged as a WARN with the first stderr line; it usually means the directory was removed between

@@ -219,12 +219,34 @@ if want names; then
     DRIFT=$(sed -n 's/^VERIFY RESULT .* drift=\([0-9]*\) .*/\1/p' "$T/verify1.log")
     check "verify tier 2 detects silent corruption in '資料', 'My folder', 'a[1]' (drift=${DRIFT:-?}, rc=$RC)" '[ "$RC" -eq 1 ] && [ "${DRIFT:-0}" -eq 3 ]'
 
-    # Same tree, UTF-8 locale (LANG=C.UTF-8 is a common addition to an image): grep drops lines that
-    # are not valid UTF-8, so a v3.16 lister with a grep stage skipped the folder without any error.
-    DST2=$(fresh_dst names-utf8)
-    LC_ALL=C.UTF-8 LOCAL_NAS_PATH="$DST2" PARALLEL_WORKERS=3 timeout --kill-after=10 300 "$S/nas-sync-parallel.sh" > "$T/names-utf8.log" 2>&1
-    check "folder with a non-UTF-8 name is synced under a UTF-8 locale" \
-        '[ "$(cat "$DST2/$B5/f.txt" 2>/dev/null)" = "content of <$B5>" ]'
+    # Same tree, UTF-8 locale (LANG=C.UTF-8 is a common addition to an image). Two traps for a
+    # name that is not valid UTF-8: grep drops the line (a v3.16 lister with a grep stage skipped
+    # the folder without any error), and bash 5.2 `read -d ''` loses the NEXT record after a name
+    # ending in a UTF-8 lead byte (the Big5 fixture ends in 0xDA, so "folder" vanished). Every
+    # folder is checked, not just the Big5 one, and the scripts must still exit 0.
+    if locale -a 2>/dev/null | grep -qiE '^c\.utf-?8$'; then
+        DST2=$(fresh_dst names-utf8)
+        LC_ALL=C.UTF-8 LOCAL_NAS_PATH="$DST2" PARALLEL_WORKERS=3 timeout --kill-after=10 300 "$S/nas-sync-parallel.sh" > "$T/names-utf8.log" 2>&1
+        RC=$?
+        MIS2=""
+        for d in "${NAMES[@]}"; do
+            [ "$(cat "$DST2/$d/f.txt" 2>/dev/null)" = "content of <$d>" ] || MIS2="$MIS2 $(printf '%q' "$d")"
+        done
+        check "every folder synced with its own content under a UTF-8 locale (incl. non-UTF-8 names)${MIS2:+ — wrong:$MIS2}$([ "$RC" -eq 0 ] || echo " (rc=$RC)")" \
+            '[ "$RC" -eq 0 ] && [ -z "$MIS2" ]'
+
+        # Verify tier 2 against that in-sync UTF-8 target, same locale: all N dirs must be listed,
+        # read and checked (the run dies on a lost name, and the N-of-N log line must hold).
+        NN=${#NAMES[@]}
+        LC_ALL=C.UTF-8 LOCAL_NAS_PATH="$DST2" VERIFY_MODE=checksum VERIFY_SLICES=1 timeout --kill-after=10 300 "$S/nas-sync-verify.sh" > "$T/verify-utf8.log" 2>&1
+        RC=$?
+        TIER2=$(sed -n 's/^.* - Tier 2: \([0-9]*\) of \([0-9]*\) top-level dirs in this slice$/\1 \2/p' "$T/verify-utf8.log")
+        OK2=0; [ "$RC" -eq 0 ] && [ "$TIER2" = "$NN $NN" ] && grep -q "VERIFY RESULT .* drift=0 " "$T/verify-utf8.log" && OK2=1
+        check "verify tier 2 under a UTF-8 locale lists all $NN top-level dirs (drift=0)$([ "$OK2" -eq 1 ] || echo " (rc=$RC, 'Tier 2: N of M' = '${TIER2:-none}')")" \
+            '[ "$OK2" -eq 1 ]'
+    else
+        skip "UTF-8 sub-checks (parallel folder contents, verify tier 2): no C.UTF-8 / C.utf8 locale in 'locale -a'"
+    fi
 fi
 
 # ================================================================ loose

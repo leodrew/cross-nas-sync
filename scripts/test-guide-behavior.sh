@@ -369,14 +369,20 @@ fi
 # ================================================================ signal
 # Start the container command under tini as PID 1 of a fresh PID namespace, wait until rsync is
 # mid-file, SIGTERM PID 1 (what kubelet does), and inspect the target.
+# SIG_AFTER=<seconds> (set in the caller's environment) sends the SIGTERM that long after the start
+# instead, for a signal that must land before rsync runs; no partial file is expected then.
 sigterm_run() {  # sigterm_run <label> <dst> <logfile> <tini flags> -- command...
     local label="$1" dst="$2" log="$3" tf="$4"; shift 5
     unshare --pid --fork --mount-proc tini $tf -- "$@" > "$log" 2>&1 &
     local u=$! i tpid t0 t1
-    for i in $(seq 1 900); do
-        find "$dst" -name '.blob*' -type f 2>/dev/null | grep -q . && break; sleep 0.1
-    done
-    sleep 1
+    if [ -n "${SIG_AFTER:-}" ]; then
+        sleep "$SIG_AFTER"
+    else
+        for i in $(seq 1 900); do
+            find "$dst" -name '.blob*' -type f 2>/dev/null | grep -q . && break; sleep 0.1
+        done
+        sleep 1
+    fi
     tpid=$(pgrep -P "$u" -x tini | head -n 1)
     if [ -z "$tpid" ]; then
         bad "$label: container did not start (no tini found)"
@@ -399,7 +405,7 @@ sigterm_run() {  # sigterm_run <label> <dst> <logfile> <tini flags> -- command..
     orphans=$(find "$dst" -name '.blob*' -type f ! -path '*/.rsync-partial/*' | wc -l)
     partials=$(find "$dst" -path '*/.rsync-partial/*' -type f | wc -l)
     check "$label: no orphan .<file>.XXXXXX temp file left in the target (found $orphans)" '[ "$orphans" -eq 0 ]'
-    check "$label: interrupted file kept in .rsync-partial/ (found $partials)" '[ "$partials" -ge 1 ]'
+    [ -n "${SIG_AFTER:-}" ] || check "$label: interrupted file kept in .rsync-partial/ (found $partials)" '[ "$partials" -ge 1 ]'
     check "$label: status file records the interruption" 'grep -q "interrupted=TERM" "$dst/.nas-sync-status/last-run" 2>/dev/null'
 }
 
@@ -418,6 +424,16 @@ if want signal; then
                 sigterm_run "tini ${tf:-(no -g)} $mode" "$DST" "$T/sig-$mode$tf.log" "$tf" -- "$S/run-with-sidecar-quit.sh"
         done
     done
+    # SIGTERM while the pre-flight is still running (a slow `mountpoint` on a stale NFS mount): the
+    # signal only sets a flag, so the mode script must check it before it starts rsync. ~2 MB/s
+    # keeps an rsync that wrongly starts running past the 60 s the helper waits, so it would be
+    # SIGKILLed mid-file and leave its temp file behind.
+    mkdir -p "$T/shim-mp"
+    printf '%s\n' '#!/bin/bash' 'sleep 5' 'exit 0' > "$T/shim-mp/mountpoint"; chmod +x "$T/shim-mp/mountpoint"
+    shim_set 2000
+    DST=$(fresh_dst "sig-preflight")
+    PATH="$T/shim-mp:$T/shim:$PATH" SYNC_MODE=standard LOCAL_NAS_PATH="$DST" ISTIO_ADMIN_PORT=1 SIG_AFTER=1 \
+        sigterm_run "SIGTERM during pre-flight" "$DST" "$T/sig-preflight.log" "-g" -- "$S/run-with-sidecar-quit.sh"
     shim_off
 fi
 

@@ -1207,6 +1207,7 @@ log "Remote: $REMOTE_URL/ → $LOCAL_NAS_PATH"
 wait_for_remote || die "Remote not reachable after ${PREFLIGHT_RETRIES} attempts"
 timeout 10 mountpoint -q "$LOCAL_NAS_PATH" 2>/dev/null || die "Local NAS not mounted"
 log "OK Pre-flight"
+check_term    # a SIGTERM during the pre-flight is only a flag — stop here, before rsync starts
 
 if [ "$SYNC_DIRECTION" = "pull" ]; then
     rsync $RSYNC_FLAGS "${REMOTE_URL}/" "${LOCAL_NAS_PATH}/" 2>&1
@@ -1622,6 +1623,7 @@ log "=== NAS SYNC (incremental) client=${CLIENT_ID:-<legacy>} ==="
 wait_for_remote || die "Remote not reachable after ${PREFLIGHT_RETRIES} attempts"
 timeout 10 mountpoint -q "$LOCAL_NAS_PATH" 2>/dev/null || die "Local NAS not mounted"
 log "OK Pre-flight"
+check_term    # a SIGTERM during the pre-flight is only a flag — stop here, before any rsync starts
 
 run_full_sync() {
     rsync $RSYNC_FLAGS "${REMOTE_URL}/" "${LOCAL_NAS_PATH}/" 2>&1
@@ -1668,6 +1670,7 @@ fi
 
 if grep -q "^FULL_SYNC$" "$MANIFEST_LOCAL"; then
     log "FULL_SYNC signaled (first run for this client)"
+    check_term
     run_full_sync
     RC=$?
 else
@@ -1677,6 +1680,7 @@ else
         log "Nothing changed. Skipping."
         RC=0
     else
+        check_term
         rsync $RSYNC_FLAGS --files-from="$MANIFEST_LOCAL" \
             "${REMOTE_URL}/" "${LOCAL_NAS_PATH}/" 2>&1
         RC=${PIPESTATUS[0]}
@@ -1738,12 +1742,17 @@ CHILD=""
 trap 'GOT_TERM=1; [ -n "$CHILD" ] && kill -TERM "$CHILD" 2>/dev/null' TERM INT
 "$SCRIPT" &
 CHILD=$!
+# A TERM that landed before CHILD was set was only recorded — nothing existed to forward it to.
+[ -n "$GOT_TERM" ] && kill -TERM "$CHILD" 2>/dev/null
 wait_child "$CHILD"
 RC=$WAIT_RC
+# Read GOT_TERM ONCE. A TERM that lands later must not make one line say exit=0 and the next
+# say interrupted: everything below uses INTERRUPTED, never GOT_TERM.
+INTERRUPTED=$GOT_TERM
 # An interrupted run is never a success, whatever the mode script returned.
-[ -n "$GOT_TERM" ] && [ "$RC" -eq 0 ] && RC=143
+[ -n "$INTERRUPTED" ] && [ "$RC" -eq 0 ] && RC=143
 ELAPSED=$(( $(date +%s) - START ))
-log "Mode $SYNC_MODE finished: exit=$RC elapsed=${ELAPSED}s${GOT_TERM:+ (interrupted by SIGTERM)}"
+log "Mode $SYNC_MODE finished: exit=$RC elapsed=${ELAPSED}s${INTERRUPTED:+ (interrupted by SIGTERM)}"
 
 # ---- Status file (v3.15) ----
 # Answers "did last night's sync work?" without pod logs, which age out with
@@ -1759,7 +1768,7 @@ write_status() {
 if [ "$STATUS_ENABLED" = "true" ]; then
     if mkdir -p "$STATUS_DIR" 2>/dev/null; then
         # v3.16: " interrupted=TERM" is appended when the run was stopped by SIGTERM.
-        LINE="ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ') mode=${SYNC_MODE} client=${CLIENT_ID:-none} exit=${RC} elapsed=${ELAPSED}s host=$(hostname)${GOT_TERM:+ interrupted=TERM}"
+        LINE="ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ') mode=${SYNC_MODE} client=${CLIENT_ID:-none} exit=${RC} elapsed=${ELAPSED}s host=$(hostname)${INTERRUPTED:+ interrupted=TERM}"
         write_status "last-run" "$LINE" || log "WARN: could not write ${STATUS_DIR}/last-run (sync result unaffected)"
         if [ "$RC" -eq 0 ]; then
             write_status "last-success" "$LINE" || log "WARN: could not write ${STATUS_DIR}/last-success (sync result unaffected)"
@@ -1817,6 +1826,9 @@ on_term() {
 }
 trap on_term TERM INT
 /userapp/scripts/dispatch-sync.sh &
+# A TERM that landed before the fork had no child to signal (the group kill only reached this
+# shell) — pass it on now. Not on_term again: that would send the group TERM twice.
+[ -n "$GOT_TERM" ] && kill -TERM $! 2>/dev/null
 wait_child $!
 SYNC_EXIT=$WAIT_RC
 log "Sync exited: $SYNC_EXIT"
@@ -2295,12 +2307,19 @@ list_top_dirs() {
 # `wait` return early (>128) while the child is still running — keep waiting until it is
 # gone. A shell that exits before its children unwinds the chain up to tini (PID 1), and
 # the kernel then SIGKILLs rsync before it can save its partial file.
+# If the child exits while a trap is running, bash reaps it inside the handler and that
+# `wait` returns 128+signal, not the child's status. bash keeps the reaped child's status, so
+# once the child is gone one more `wait` returns it; 127 means nothing was kept — then the
+# first value is all there is.
 wait_child() {
-    local r
+    local r r2
     while :; do
         wait "$1"; r=$?
         [ "$r" -le 128 ] && { WAIT_RC=$r; return; }
-        kill -0 "$1" 2>/dev/null || { WAIT_RC=$r; return; }
+        kill -0 "$1" 2>/dev/null && continue
+        wait "$1" 2>/dev/null; r2=$?
+        [ "$r2" -eq 127 ] && r2=$r
+        WAIT_RC=$r2; return
     done
 }
 

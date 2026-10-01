@@ -1161,6 +1161,10 @@ log() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"; }
 log_error() { echo "$(date '+%Y-%m-%d %H:%M:%S') - ERROR: $1" >&2; }
 die() { log_error "$1"; exit "${2:-1}"; }
 
+# v3.16: shared helpers (§8.11). On SIGTERM, let rsync save its partial, then stop.
+. "$(dirname "${BASH_SOURCE[0]}")/nas-sync-lib.sh" || die "nas-sync-lib.sh not found (§8.11)"
+term_trap_install
+
 # v3.15: rsync 23/24 are NORMAL on a live source (files vanish mid-run). Treating them
 # as failure makes every healthy run show Failed and burns backoffLimit retries.
 rsync_rc_ok() {
@@ -1181,6 +1185,7 @@ wait_for_remote() {
         nc -z -w 10 "$REMOTE_HOST" "$REMOTE_PORT" 2>/dev/null && return 0
         log "Remote not reachable yet (attempt ${i}/${PREFLIGHT_RETRIES}) — sidecar may still be starting"
         sleep "$PREFLIGHT_WAIT"
+        check_term
         i=$((i+1))
     done
     return 1
@@ -1209,6 +1214,7 @@ else
     rsync $RSYNC_FLAGS "${LOCAL_NAS_PATH}/" "${REMOTE_URL}/" 2>&1
 fi
 RC=${PIPESTATUS[0]}
+check_term
 
 rsync_rc_ok "$RC" && SYNC_EXIT=0 || SYNC_EXIT=$RC
 
@@ -1529,7 +1535,7 @@ exit 0
 ```bash
 #!/bin/bash
 #############################################
-# NAS Sync — INCREMENTAL mode (v3.15)
+# NAS Sync — INCREMENTAL mode (v3.16)
 # Sync only changed files from server manifest.
 # See §12.1 for what mtime detection cannot see —
 # the weekly reconcile (§9A.4) is REQUIRED.
@@ -1574,6 +1580,10 @@ log() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"; }
 log_error() { echo "$(date '+%Y-%m-%d %H:%M:%S') - ERROR: $1" >&2; }
 die() { log_error "$1"; exit "${2:-1}"; }
 
+# v3.16: shared helpers (§8.11). On SIGTERM, let rsync save its partial, then stop.
+. "$(dirname "${BASH_SOURCE[0]}")/nas-sync-lib.sh" || die "nas-sync-lib.sh not found (§8.11)"
+term_trap_install
+
 # rsync 23/24 are normal on a live source — see §8.2.
 rsync_rc_ok() {
     case "$1" in
@@ -1590,6 +1600,7 @@ wait_for_remote() {
         nc -z -w 10 "$REMOTE_HOST" "$REMOTE_PORT" 2>/dev/null && return 0
         log "Remote not reachable yet (attempt ${i}/${PREFLIGHT_RETRIES}) — sidecar may still be starting"
         sleep "$PREFLIGHT_WAIT"
+        check_term
         i=$((i+1))
     done
     return 1
@@ -1621,12 +1632,14 @@ log "Fetching manifest ($MANIFEST_NAME)..."
 rsync -a --password-file="$RSYNC_PASSWORD_FILE" \
     "${REMOTE_URL}/${MANIFEST_NAME}" "$MANIFEST_LOCAL" 2>&1
 FETCH_RC=$?
+check_term
 
 # v3.15: trust the EXIT CODE, not just the file's existence.
 if [ "$FETCH_RC" -ne 0 ] || [ ! -s "$MANIFEST_LOCAL" ]; then
     log "Manifest fetch failed (rc=$FETCH_RC) — FULL sync fallback"
     run_full_sync
     RC=$?
+    check_term
     rsync_rc_ok "$RC" && SYNC_EXIT=0 || SYNC_EXIT=$RC
     DUR=$(( $(date +%s) - START ))
     log "=== COMPLETE: mode=full-fallback rsync_rc=$RC exit=$SYNC_EXIT, ${DUR}s ==="
@@ -1637,6 +1650,7 @@ fi
 if [ -n "$META_NAME" ]; then
     rsync -a --password-file="$RSYNC_PASSWORD_FILE" \
         "${REMOTE_URL}/${META_NAME}" "$META_LOCAL" >/dev/null 2>&1
+    check_term
     if [ -s "$META_LOCAL" ]; then
         GEN_AT=$(awk -F= '/^generated_at=/{print $2}' "$META_LOCAL")
         case "$GEN_AT" in ''|*[!0-9]*) GEN_AT=0 ;; esac
@@ -1668,6 +1682,7 @@ else
         RC=${PIPESTATUS[0]}
     fi
 fi
+check_term
 
 rsync_rc_ok "$RC" && SYNC_EXIT=0 || SYNC_EXIT=$RC
 
@@ -1696,6 +1711,9 @@ STATUS_ENABLED="${STATUS_ENABLED:-true}"
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [dispatch] $1"; }
 
+# v3.16: shared helpers (§8.11) — wait_child.
+. "$(dirname "${BASH_SOURCE[0]}")/nas-sync-lib.sh" || { log "ERROR: nas-sync-lib.sh not found (§8.11)"; exit 1; }
+
 case "$SYNC_MODE" in
     parallel)    SCRIPT=/userapp/scripts/nas-sync-parallel.sh ;;
     incremental) SCRIPT=/userapp/scripts/nas-sync-incremental.sh ;;
@@ -1710,10 +1728,22 @@ esac
 
 log "Mode: $SYNC_MODE"
 START=$(date +%s)
-"$SCRIPT"
-RC=$?
+# v3.16: never exit before the mode script does. On SIGTERM, pass it on and keep waiting —
+# the mode script is letting rsync move its partial file into .rsync-partial/. If this shell
+# exited first, the chain up to tini (PID 1) would unwind and the kernel would SIGKILL rsync
+# mid-cleanup, leaving a .<name>.XXXXXX temp file in the target tree. Not `exec`: the status
+# write below must run after the mode script.
+GOT_TERM=""
+CHILD=""
+trap 'GOT_TERM=1; [ -n "$CHILD" ] && kill -TERM "$CHILD" 2>/dev/null' TERM INT
+"$SCRIPT" &
+CHILD=$!
+wait_child "$CHILD"
+RC=$WAIT_RC
+# An interrupted run is never a success, whatever the mode script returned.
+[ -n "$GOT_TERM" ] && [ "$RC" -eq 0 ] && RC=143
 ELAPSED=$(( $(date +%s) - START ))
-log "Mode $SYNC_MODE finished: exit=$RC elapsed=${ELAPSED}s"
+log "Mode $SYNC_MODE finished: exit=$RC elapsed=${ELAPSED}s${GOT_TERM:+ (interrupted by SIGTERM)}"
 
 # ---- Status file (v3.15) ----
 # Answers "did last night's sync work?" without pod logs, which age out with
@@ -1728,7 +1758,8 @@ write_status() {
 
 if [ "$STATUS_ENABLED" = "true" ]; then
     if mkdir -p "$STATUS_DIR" 2>/dev/null; then
-        LINE="ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ') mode=${SYNC_MODE} client=${CLIENT_ID:-none} exit=${RC} elapsed=${ELAPSED}s host=$(hostname)"
+        # v3.16: " interrupted=TERM" is appended when the run was stopped by SIGTERM.
+        LINE="ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ') mode=${SYNC_MODE} client=${CLIENT_ID:-none} exit=${RC} elapsed=${ELAPSED}s host=$(hostname)${GOT_TERM:+ interrupted=TERM}"
         write_status "last-run" "$LINE" || log "WARN: could not write ${STATUS_DIR}/last-run (sync result unaffected)"
         if [ "$RC" -eq 0 ]; then
             write_status "last-success" "$LINE" || log "WARN: could not write ${STATUS_DIR}/last-success (sync result unaffected)"
@@ -1745,6 +1776,11 @@ exit $RC
 > `cat /mnt/nas-target/.nas-sync-status/last-success`. Rule of thumb: if `last-success` is
 > older than **2× the CronJob interval**, investigate (§13). `last-run` newer than
 > `last-success` means the most recent attempt failed.
+>
+> **`interrupted=TERM` (v3.16)** at the end of `last-run` means the pod was stopped
+> (deadline, node drain, rollout, `kubectl delete`) while syncing. rsync kept its partial file
+> in `.rsync-partial/`, so the next run resumes it; the run is recorded as `exit=143` and
+> never counts as a success.
 
 ### 8.6 File: `cluster-a/scripts/run-with-sidecar-quit.sh` (CronJob wrapper)
 
@@ -1763,10 +1799,33 @@ SIDECAR_QUIT_TIMEOUT="${SIDECAR_QUIT_TIMEOUT:-10}"
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [wrapper] $1"; }
 
+# v3.16: shared helpers (§8.11) — wait_child.
+. "$(dirname "${BASH_SOURCE[0]}")/nas-sync-lib.sh" || { log "ERROR: nas-sync-lib.sh not found (§8.11)"; exit 1; }
+
 log "=== Wrapper start (SYNC_MODE=${SYNC_MODE:-standard}) ==="
-/userapp/scripts/dispatch-sync.sh
-SYNC_EXIT=$?
+
+# v3.16: this shell is the top of the CronJob chain: tini → wrapper → dispatcher → mode
+# script → rsync. On SIGTERM it signals its own process group ONCE — so delivery does not
+# depend on `tini -g` — and then WAITS. v3.15 had no trap: this shell died at once, tini
+# (PID 1) exited, and the kernel SIGKILLed rsync before it could save its partial file.
+GOT_TERM=""
+on_term() {
+    [ -n "$GOT_TERM" ] && return     # kill -TERM 0 below signals this shell too
+    GOT_TERM=1
+    log "SIGTERM — signalling the sync, waiting for rsync to stop cleanly"
+    kill -TERM 0 2>/dev/null
+}
+trap on_term TERM INT
+/userapp/scripts/dispatch-sync.sh &
+wait_child $!
+SYNC_EXIT=$WAIT_RC
 log "Sync exited: $SYNC_EXIT"
+
+if [ -n "$GOT_TERM" ]; then
+    # The pod is being deleted: kubelet is stopping istio-proxy itself, nothing to quit.
+    log "=== Interrupted: exit $SYNC_EXIT ==="
+    exit "$SYNC_EXIT"
+fi
 
 if [ "$SIDECAR_QUIT_ENABLED" != "true" ]; then
     exit $SYNC_EXIT
@@ -2428,6 +2487,8 @@ spec:
             # the two together cover clusters where this annotation is disallowed by policy.
             proxy.istio.io/config: '{"holdApplicationUntilProxyStarts": true}'
         spec:
+          # v3.16: time for rsync to stop cleanly when the pod is deleted (§8.11).
+          terminationGracePeriodSeconds: 60
           containers:
             - name: nas-sync-client
               image: your-registry.example.com/nas-sync-client:3.16   # ◄ MODIFY
@@ -2597,6 +2658,8 @@ spec:
           annotations:
             proxy.istio.io/config: '{"holdApplicationUntilProxyStarts": true}'
         spec:
+          # v3.16: time for rsync to stop cleanly when the pod is deleted (§8.11).
+          terminationGracePeriodSeconds: 60
           containers:
             - name: nas-sync-client
               image: your-registry.example.com/nas-sync-client:3.16   # ◄ MODIFY
@@ -2702,6 +2765,8 @@ spec:
           annotations:
             proxy.istio.io/config: '{"holdApplicationUntilProxyStarts": true}'
         spec:
+          # v3.16: time for rsync to stop cleanly when the pod is deleted (§8.11).
+          terminationGracePeriodSeconds: 60
           containers:
             - name: nas-sync-client
               image: your-registry.example.com/nas-sync-client:3.16   # ◄ MODIFY

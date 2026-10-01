@@ -174,12 +174,15 @@ stay where they are, because moving them is unrelated refactoring.
    Applying the client exclude file here drops `.nas-sync-state`, `.git`, and similar names with the same semantics
    as the sync itself (F4e).
 2. Keep only lines matching
-   `^d[^ ]* +[0-9,.]+ [0-9]{4}/[0-9]{2}/[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} (.*)$`, and drop `.`.
+   `^d[^ ]* +[0-9,.]+ [0-9]{4}/[0-9]{2}/[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} (.*)$`, using `sed` under `LC_ALL=C`.
    - The name is everything after the timestamp, so spaces, leading spaces and tabs survive.
+   - `LC_ALL=C` parses bytes, not characters, so a name that is not valid UTF-8 (legacy Big5/MS950) survives
+     whatever `LANG` the image sets. A `grep -vx '\.'` stage here silently dropped such names under a UTF-8
+     locale (`binary file matches` on stderr, exit 0), so that folder was never synced; there is no `grep` stage.
    - Daemon MOTD lines never match.
    - Top-level symlinks are left to the loose-files pass, as in v3.15.
-3. Decode only `\#ooo` sequences, using
-   `perl -ne 'chomp; s/\\#([0-7]{3})/chr(oct($1))/ge; print "$_\0"'`.
+3. Drop the `.` entry and decode only `\#ooo` sequences, in one `perl` stage:
+   `perl -ne 'chomp; next if $_ eq "."; s/\\#([0-7]{3})/chr(oct($1))/ge; print "$_\0"'`.
    - bash `printf %b` is unsafe here, because it would also turn a literal `\n` inside a name into a newline.
    - `perl` comes from `perl-base`, which is Essential in `ubuntu:24.04`.
    - §8.8's tool check gains `command -v perl`.
@@ -192,14 +195,25 @@ stay where they are, because moving them is unrelated refactoring.
 
 **Workers**
 - `list_top_dirs` output becomes NUL-separated `index, name` pairs.
-- These are dispatched with `xargs -0 -n 2 -P "$PARALLEL_WORKERS"`.
+- These are dispatched with `xargs -0 -n 2 -P "$PARALLEL_WORKERS"`, run in the **background** as
+  `( trap '' TERM; exec xargs … ) < "$FOLDER_LIST" &` and collected with `wait_child $!` (`XARGS_RC=$WAIT_RC`).
+  A foreground xargs would defer the SIGTERM trap until xargs had exited, by which time it had started every
+  remaining unit. The chunk path writes its sorted NUL list to a file first and redirects xargs's stdin from it,
+  so `$!` is xargs itself.
+- **Stop file.** `STOP_FILE="$WORK_DIR/stop"` is exported. The SIGTERM trap (§8.11 `term_trap_install`) creates it
+  when `STOP_FILE` is set. The first thing `sync_one_chunk` and `sync_one_folder` do is check for it: if it exists,
+  they log a `SKIP` line, write rc `143` to the unit's rc file (so the rc-count invariant below still holds) and
+  return 0 without starting rsync. Without it, a worker that finished returned 0 and xargs started the next unit
+  after the one-shot group SIGTERM had passed, so queued units ran to completion. `WORK_DIR` is removed before
+  use, so a stop file left by a killed run with the same PID cannot skip this run's units.
 - Each worker runs
   `printf '%s\0' "$name" | rsync $RSYNC_FLAGS -r --from0 --files-from=- "${REMOTE_URL}/" "${LOCAL_NAS_PATH}/"`.
   - The name is never part of a remote path, so it is never glob-expanded (F4d).
   - `-r` must be explicit, because `-a` does not imply it under `--files-from`.
 
 **Bookkeeping**
-- Each worker writes its rc to `rc/folder-<index>` and its name to `rc/folder-<index>.name`.
+- Each worker writes its rc to `rc/folder-<index>` and its name to `names/folder-<index>` (`NAME_DIR`, a separate
+  directory, so `rc/` holds only rc files and the rc-count invariant below stays exact).
 - The failure report prints names with `printf %q`.
 - Log prefixes use the index, not the name, so the `sed "s/^/[$folder] /"` injection is gone.
 
@@ -241,7 +255,7 @@ wait_child() { local r; while :; do wait "$1"; r=$?; [ "$r" -le 128 ] && { WAIT_
 |---|---|
 | §8.6 wrapper — top of the CronJob chain | 1. The trap guards against re-entry, then runs `kill -TERM 0` **once**, signalling its own process group, so delivery does not depend on `tini -g`. 2. The dispatcher runs in the background; the wrapper waits with `wait_child`. 3. When interrupted, it skips the sidecar quit (kubelet is already stopping `istio-proxy`) and exits with the dispatcher's code. |
 | §8.5 dispatcher | 1. The mode script runs in the background. 2. The trap only records `GOT_TERM=1`. 3. `wait_child` collects the mode script's exit code. 4. If interrupted and the mode script still returned 0, `RC` becomes 143; the status line gains ` interrupted=TERM`, and `last-success` is **not** written. Status parsers that split on spaces and `=` are unaffected. **No `exec`** — the status write needs the dispatcher to outlive the mode script. |
-| Mode scripts (§8.2, §8.3, §8.4, §8.10) | 1. `term_trap_install` sets `trap 'TERMINATING=1' TERM INT`. bash runs it only **after** the foreground rsync exits, which lets rsync move its partial file into `.rsync-partial/` first. 2. `check_term` runs after every rsync step and inside the `wait_for_remote` loop; when the flag is set it logs and does `exit 143`, never starting the next step. 3. In §8.3, xargs runs as `( trap '' TERM; exec xargs … )`, so it waits for all workers while each rsync still handles TERM itself. |
+| Mode scripts (§8.2, §8.3, §8.4, §8.10) | 1. `term_trap_install` sets `trap 'TERMINATING=1' TERM INT` (and, when `STOP_FILE` is set, creates that file). bash runs it only **after** the foreground rsync exits, which lets rsync move its partial file into `.rsync-partial/` first. 2. `check_term` runs after every rsync step and inside the `wait_for_remote` loop; when the flag is set it logs and does `exit 143`, never starting the next step. 3. In §8.3, xargs runs in the **background** as `( trap '' TERM; exec xargs … ) &`, collected with `wait_child $!`, so the trap fires at once and xargs keeps waiting for the in-flight workers while each rsync still handles TERM itself. The trap also creates `STOP_FILE`; each worker checks it first and, if it exists, logs `SKIP`, records rc 143 and does not start rsync. So running rsyncs stop and save their partials, queued units are skipped, and the script exits 143. |
 | §8.7 entrypoint — Deployment | 1. **No `exec cron -f`.** bash stays tini's child for the pod's whole life. 2. The initial sync runs in the background under `flock`, collected with `wait_child`. 3. After that, `cron -f &` runs, followed by `wait_child "$CRON_PID"`. 4. On SIGTERM it stops cron, then sends TERM to **each in-flight run's process group**. The groups are found as the pgids of `/userapp/scripts/dispatch-sync.sh` processes, because cron gives each job its own session, which `tini -g` cannot reach. 5. It then drains: it polls until no run remains, for up to `SHUTDOWN_WAIT` (new, default `50`), then exits 143. 6. If cron exits unexpectedly, the entrypoint exits 1 so the pod restarts. |
 
 **Grace period.** `terminationGracePeriodSeconds: 60` is set explicitly in §9A.2, §9A.4, §9A.5 and §10B.1.

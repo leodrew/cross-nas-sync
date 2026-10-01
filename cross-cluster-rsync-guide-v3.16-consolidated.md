@@ -1051,6 +1051,8 @@ FOLDER_LIST="${WORK_DIR}/folders.bin"  # "index\0name\0" pairs for the workers
 CHUNK_DIR="${WORK_DIR}/chunks"
 RC_DIR="${WORK_DIR}/rc"                # one rc file per unit — nothing else in here
 NAME_DIR="${WORK_DIR}/names"           # folder name per index, for the failure report
+CHUNK_LIST="${WORK_DIR}/chunks.bin"    # sorted chunk paths, NUL-terminated (outside CHUNK_DIR)
+STOP_FILE="${WORK_DIR}/stop"           # created by the SIGTERM trap (§8.11): queued units must not start
 REMOTE_URL="rsync://${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PORT}/${REMOTE_MODULE}"
 
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"; }
@@ -1090,6 +1092,9 @@ RSYNC_FLAGS="$RSYNC_FLAGS --password-file=$RSYNC_PASSWORD_FILE"
 [ -f "$EXCLUDE_FILE" ] && RSYNC_FLAGS="$RSYNC_FLAGS --exclude-from=$EXCLUDE_FILE"
 
 trap 'rm -rf "$WORK_DIR"' EXIT
+# PIDs repeat across containers: a work dir left by a killed run must not leak its STOP_FILE
+# (or rc files) into this one, or every unit would be skipped.
+rm -rf "$WORK_DIR"
 mkdir -p "$CHUNK_DIR" "$RC_DIR" "$NAME_DIR" || die "Cannot create $WORK_DIR"
 
 START=$(date +%s)
@@ -1100,12 +1105,19 @@ wait_for_remote || die "Remote not reachable after ${PREFLIGHT_RETRIES} attempts
 timeout 10 mountpoint -q "$LOCAL_NAS_PATH" 2>/dev/null || die "Local NAS not mounted"
 log "OK Pre-flight"
 
-export REMOTE_URL LOCAL_NAS_PATH RSYNC_FLAGS CHUNK_DIR RC_DIR NAME_DIR
+export REMOTE_URL LOCAL_NAS_PATH RSYNC_FLAGS CHUNK_DIR RC_DIR NAME_DIR STOP_FILE
 
 # ---- Worker: one server-generated chunk list ----
+# v3.16: after SIGTERM no new unit may start. The trap (§8.11) creates STOP_FILE; a unit that
+# finds it logs SKIP and records rc 143, so the rc-file count still equals the unit count.
 sync_one_chunk() {
     local chunk="$1"
     local name; name=$(basename "$chunk")
+    if [ -e "$STOP_FILE" ]; then
+        echo "$(date '+%H:%M:%S') [worker] SKIP  $name (SIGTERM received — not started)"
+        echo 143 > "${RC_DIR}/${name}"
+        return 0
+    fi
     local s; s=$(date +%s)
     echo "$(date '+%H:%M:%S') [worker] START $name ($(wc -l < "$chunk" | tr -d ' ') files)"
     rsync $RSYNC_FLAGS --files-from="$chunk" "${REMOTE_URL}/" "${LOCAL_NAS_PATH}/" 2>&1 | sed "s/^/[$name] /"
@@ -1121,6 +1133,11 @@ export -f sync_one_chunk
 # spaces, quotes, CJK or a newline. -r is explicit: -a does not imply it under --files-from.
 sync_one_folder() {
     local idx="$1" name="$2"
+    if [ -e "$STOP_FILE" ]; then
+        echo "$(date '+%H:%M:%S') [worker] SKIP  folder#${idx} (SIGTERM received — not started)"
+        echo 143 > "${RC_DIR}/folder-${idx}"
+        return 0
+    fi
     local s; s=$(date +%s)
     printf '%s\0' "$name" > "${NAME_DIR}/folder-${idx}"
     echo "$(date '+%H:%M:%S') [worker] START folder#${idx} $(printf '%q' "$name")"
@@ -1204,11 +1221,16 @@ if [ "$USE_CHUNKS" = true ]; then
     UNIT="chunks"
     UNIT_COUNT="$NCHUNK"
     EXPECTED_RC="$NCHUNK"
-    # xargs ignores SIGTERM so it waits for every worker; each rsync still handles SIGTERM
-    # itself and saves its partial (§8.11). -0 so no character in a path is special.
-    find "$CHUNK_DIR" -maxdepth 1 -name "$CHUNK_GLOB" -print0 | sort -z \
-        | ( trap '' TERM; exec xargs -0 -n 1 -P "$PARALLEL_WORKERS" bash -c 'sync_one_chunk "$1"' _ )
-    XARGS_RC=${PIPESTATUS[2]}
+    # On SIGTERM: the rsyncs already running stop themselves and save their partials (§8.11),
+    # units still queued are skipped (STOP_FILE), and the script exits 143.
+    # xargs ignores TERM so it keeps waiting for the in-flight workers, and runs in the
+    # BACKGROUND so the trap fires at once: bash defers a trap until a foreground pipeline
+    # ends, and by then xargs would have started every remaining unit. -0 so no character in
+    # a path is special. The sorted list goes through a file so that $! is xargs itself.
+    find "$CHUNK_DIR" -maxdepth 1 -name "$CHUNK_GLOB" -print0 | sort -z > "$CHUNK_LIST"
+    ( trap '' TERM; exec xargs -0 -n 1 -P "$PARALLEL_WORKERS" bash -c 'sync_one_chunk "$1"' _ ) < "$CHUNK_LIST" &
+    wait_child $!
+    XARGS_RC=$WAIT_RC
 else
     UNIT="folders"
     log "Listing top-level folders..."
@@ -1234,8 +1256,11 @@ else
         i=$((i+1))
         printf '%s\0%s\0' "$i" "$n"
     done < "$NAMES_BIN" > "$FOLDER_LIST"
-    ( trap '' TERM; exec xargs -0 -n 2 -P "$PARALLEL_WORKERS" bash -c 'sync_one_folder "$1" "$2"' _ ) < "$FOLDER_LIST"
-    XARGS_RC=$?
+    # Same shutdown rules as the chunk path above: background xargs that ignores TERM, queued
+    # units skipped via STOP_FILE, running rsyncs save their partials, exit 143.
+    ( trap '' TERM; exec xargs -0 -n 2 -P "$PARALLEL_WORKERS" bash -c 'sync_one_folder "$1" "$2"' _ ) < "$FOLDER_LIST" &
+    wait_child $!
+    XARGS_RC=$WAIT_RC
 fi
 
 # ---- Tally worker results: one bad worker must not hide the others ----
@@ -1919,10 +1944,14 @@ exit 0
 # the helpers v3.16 introduced:
 #   list_top_dirs      top-level dir names, NUL-terminated
 #   wait_child         wait that survives trap interrupts
-#   term_trap_install  on SIGTERM: let rsync finish, then stop
+#   term_trap_install  on SIGTERM: let rsync finish, then stop;
+#                      if STOP_FILE is set and non-empty, also
+#                      create that file, so a parallel run's
+#                      queued workers see the stop request (§8.3)
 #   check_term         exit 143 once SIGTERM has arrived
 # Caller provides: log(); for list_top_dirs also
-# REMOTE_URL, RSYNC_PASSWORD_FILE, EXCLUDE_FILE.
+# REMOTE_URL, RSYNC_PASSWORD_FILE, EXCLUDE_FILE;
+# optionally STOP_FILE (a path) for term_trap_install.
 #############################################
 
 # Top-level directory names of the remote module, each terminated by NUL, on stdout.
@@ -1943,9 +1972,12 @@ list_top_dirs() {
     # the time, so spaces, leading spaces and tabs survive. MOTD lines never match.
     # -8 still escapes control characters (a newline in a name is \#012): decode only
     # \#ooo — printf %b would also turn a literal "\n" inside a name into a newline.
-    sed -n 's/^d[^ ]* \{1,\}[0-9,.]\{1,\} [0-9]\{4\}\/[0-9]\{2\}\/[0-9]\{2\} [0-9]\{2\}:[0-9]\{2\}:[0-9]\{2\} //p' "$out" \
-        | grep -vx '\.' \
-        | perl -ne 'chomp; s/\\#([0-7]{3})/chr(oct($1))/ge; print "$_\0"'
+    # Bytes, not characters: sed runs under LC_ALL=C, and the "." entry is dropped inside perl
+    # (not with grep). Under a UTF-8 locale (LANG=C.UTF-8 is a common addition) grep silently
+    # drops any line that is not valid UTF-8 — a legacy Big5/MS950 folder name — so that
+    # folder would never be synced, with no error. perl reads and writes the raw bytes.
+    LC_ALL=C sed -n 's/^d[^ ]* \{1,\}[0-9,.]\{1,\} [0-9]\{4\}\/[0-9]\{2\}\/[0-9]\{2\} [0-9]\{2\}:[0-9]\{2\}:[0-9]\{2\} //p' "$out" \
+        | perl -ne 'chomp; next if $_ eq "."; s/\\#([0-7]{3})/chr(oct($1))/ge; print "$_\0"'
     rm -f "$out"
     return "$rc"
 }
@@ -1966,8 +1998,14 @@ wait_child() {
 # Mode scripts: on SIGTERM only set a flag. bash runs the trap AFTER the foreground rsync
 # exits, so rsync (which receives SIGTERM itself) moves its partial file into
 # .rsync-partial/ first. check_term then stops before the next step.
+# STOP_FILE (optional): a script that dispatches work through xargs sets it before calling
+# term_trap_install. The trap then also creates that file, which each worker checks before it
+# starts a unit — the group SIGTERM reaches only processes that already exist, so a worker
+# that starts afterwards would otherwise run to the end (§8.3).
 TERMINATING=""
-term_trap_install() { trap 'TERMINATING=1' TERM INT; }
+term_trap_install() {
+    trap 'TERMINATING=1; if [ -n "${STOP_FILE:-}" ]; then : > "$STOP_FILE"; fi' TERM INT
+}
 check_term() {
     [ -n "$TERMINATING" ] || return 0
     log "Interrupted (SIGTERM) — stopping after the current step"

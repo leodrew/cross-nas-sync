@@ -187,7 +187,8 @@ printf '\033[1m=== %s ===\033[0m  (rsync daemon on 127.0.0.1:%s)\n' "$GUIDE" "$P
 if want names; then
     head2 "names — top-level folder names (§8.3 fallback, §8.10 tier 2)"
     fresh_src
-    NAMES=( "My folder" "folder" "資料" "John's" "a[1]" "a1" "star*" "starX" " lead" $'tab\tin' $'nl\nx' "-n" "normal" )
+    B5=$'big5-\xa7\xda'      # legacy Big5/MS950 bytes: NOT valid UTF-8 (a UTF-8 locale must not drop it)
+    NAMES=( "My folder" "folder" "資料" "John's" "a[1]" "a1" "star*" "starX" " lead" $'tab\tin' $'nl\nx' "-n" "normal" "$B5" )
     for d in "${NAMES[@]}"; do mkdir -p "$T/src/$d"; printf 'content of <%s>\n' "$d" > "$T/src/$d/f.txt"; done
     echo loose > "$T/src/loose.txt"
     mkdir -p "$T/src/.nas-sync-state/clients/x" "$T/src/.git"
@@ -217,6 +218,13 @@ if want names; then
     RC=$?
     DRIFT=$(sed -n 's/^VERIFY RESULT .* drift=\([0-9]*\) .*/\1/p' "$T/verify1.log")
     check "verify tier 2 detects silent corruption in '資料', 'My folder', 'a[1]' (drift=${DRIFT:-?}, rc=$RC)" '[ "$RC" -eq 1 ] && [ "${DRIFT:-0}" -eq 3 ]'
+
+    # Same tree, UTF-8 locale (LANG=C.UTF-8 is a common addition to an image): grep drops lines that
+    # are not valid UTF-8, so a v3.16 lister with a grep stage skipped the folder without any error.
+    DST2=$(fresh_dst names-utf8)
+    LC_ALL=C.UTF-8 LOCAL_NAS_PATH="$DST2" PARALLEL_WORKERS=3 timeout --kill-after=10 300 "$S/nas-sync-parallel.sh" > "$T/names-utf8.log" 2>&1
+    check "folder with a non-UTF-8 name is synced under a UTF-8 locale" \
+        '[ "$(cat "$DST2/$B5/f.txt" 2>/dev/null)" = "content of <$B5>" ]'
 fi
 
 # ================================================================ loose
@@ -310,7 +318,7 @@ fi
 sigterm_run() {  # sigterm_run <label> <dst> <logfile> <tini flags> -- command...
     local label="$1" dst="$2" log="$3" tf="$4"; shift 5
     unshare --pid --fork --mount-proc tini $tf -- "$@" > "$log" 2>&1 &
-    local u=$! i tpid
+    local u=$! i tpid t0 t1
     for i in $(seq 1 900); do
         find "$dst" -name '.blob*' -type f 2>/dev/null | grep -q . && break; sleep 0.1
     done
@@ -321,15 +329,19 @@ sigterm_run() {  # sigterm_run <label> <dst> <logfile> <tini flags> -- command..
         kill -KILL "$u" 2>/dev/null
         return 0
     fi
+    t0=$(date +%s)
     kill -TERM "$tpid"
     for i in $(seq 1 600); do kill -0 "$u" 2>/dev/null || break; sleep 0.1; done
+    t1=$(date +%s)
     if kill -0 "$u" 2>/dev/null; then
         # PID 1 of the namespace ignored SIGTERM: SIGKILL it (the kernel then kills everything
         # inside the namespace), then the unshare process.
         kill -KILL "$tpid" 2>/dev/null; kill -KILL "$u" 2>/dev/null
         echo "(killed after 60s)" >> "$log"
     fi
-    local orphans partials
+    local orphans partials took=$(( t1 - t0 ))
+    # Parallel runs have more units than workers: queued units must be skipped, not started.
+    check "$label: stopped within 15 s of SIGTERM (took ${took}s)" '[ "$took" -le 15 ]'
     orphans=$(find "$dst" -name '.blob*' -type f ! -path '*/.rsync-partial/*' | wc -l)
     partials=$(find "$dst" -path '*/.rsync-partial/*' -type f | wc -l)
     check "$label: no orphan .<file>.XXXXXX temp file left in the target (found $orphans)" '[ "$orphans" -eq 0 ]'
@@ -340,8 +352,10 @@ sigterm_run() {  # sigterm_run <label> <dst> <logfile> <tini flags> -- command..
 if want signal; then
     head2 "signal — SIGTERM to PID 1 on the CronJob path (§8.5, §8.6, mode scripts)"
     fresh_src
-    mkdir -p "$T/src/big" "$T/src/big2"
-    head -c 40000000 /dev/urandom > "$T/src/big/blob.bin"; head -c 40000000 /dev/urandom > "$T/src/big2/blob2.bin"
+    # 4 big folders with PARALLEL_WORKERS=2: two units run, two are queued when SIGTERM arrives.
+    for d in big big2 big3 big4; do
+        mkdir -p "$T/src/$d"; head -c 40000000 /dev/urandom > "$T/src/$d/blob-$d.bin"
+    done
     shim_set 4000                                                         # ~4 MB/s → ~10 s per file
     for tf in "-g" ""; do
         for mode in standard parallel; do

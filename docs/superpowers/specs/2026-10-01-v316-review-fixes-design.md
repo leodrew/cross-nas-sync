@@ -233,8 +233,8 @@ Either failing is a run failure. This catches xargs stopping partway (F4c).
 - stderr goes to a file instead of `/dev/null`.
 - **rc handling:**
   - Any rc outside {0, 23, 24} fails the run, printing the first lines of stderr.
-  - rc 23 containing `change_dir … failed` is logged as a WARN, because the directory vanished between listing and
-    checking.
+  - rc 23 is logged as a WARN with the first stderr line; it usually means the directory was removed between
+    listing and checking.
 
 ## 6. Design C — Signals and status (F6, F7)
 

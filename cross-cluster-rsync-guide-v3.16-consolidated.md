@@ -1783,7 +1783,7 @@ docker run --rm ${REGISTRY}/nas-sync-client:3.16 sh -c \
 ```bash
 #!/bin/bash
 #############################################
-# NAS Sync — VERIFY mode (v3.15)
+# NAS Sync — VERIFY mode (v3.16)
 # Drift detection. --dry-run ONLY: transfers
 # nothing, deletes nothing.
 #   VERIFY_MODE=meta      size+mtime, whole tree (default)
@@ -1816,12 +1816,17 @@ log() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"; }
 log_error() { echo "$(date '+%Y-%m-%d %H:%M:%S') - ERROR: $1" >&2; }
 die() { log_error "$1"; exit "${2:-1}"; }
 
+# v3.16: shared helpers (§8.11). On SIGTERM, let rsync finish, then stop.
+. "$(dirname "${BASH_SOURCE[0]}")/nas-sync-lib.sh" || die "nas-sync-lib.sh not found (§8.11)"
+term_trap_install
+
 wait_for_remote() {
     local i=1
     while [ "$i" -le "$PREFLIGHT_RETRIES" ]; do
         nc -z -w 10 "$REMOTE_HOST" "$REMOTE_PORT" 2>/dev/null && return 0
         log "Remote not reachable yet (attempt ${i}/${PREFLIGHT_RETRIES})"
         sleep "$PREFLIGHT_WAIT"
+        check_term
         i=$((i+1))
     done
     return 1
@@ -1855,6 +1860,7 @@ if [ "$VERIFY_MODE" = "meta" ] || [ "$VERIFY_MODE" = "both" ]; then
     log "Tier 1: metadata verify (size+mtime), whole tree..."
     rsync $BASE_FLAGS "${REMOTE_URL}/" "${LOCAL_NAS_PATH}/" > "${WORK_DIR}/meta.out" 2>"${WORK_DIR}/meta.err"
     RC=$?
+    check_term
     if [ "$RC" -ne 0 ] && [ "$RC" -ne 24 ] && [ "$RC" -ne 23 ]; then
         log_error "rsync failed during metadata verify (rc=$RC)"
         sed -n '1,20p' "${WORK_DIR}/meta.err" >&2
@@ -1874,30 +1880,47 @@ if [ "$VERIFY_MODE" = "checksum" ] || [ "$VERIFY_MODE" = "both" ]; then
     SLICE=$(( WEEK % VERIFY_SLICES ))
     log "Tier 2: checksum verify, slice $SLICE of $VERIFY_SLICES (week $WEEK)..."
 
-    rsync --list-only --password-file="$RSYNC_PASSWORD_FILE" "${REMOTE_URL}/" 2>/dev/null \
-        | awk '$1 ~ /^d/ && $NF != "." {print $NF}' > "${WORK_DIR}/topdirs.txt"
+    # v3.16: same top-level list as the parallel fallback (§8.11). v3.15's awk cut names at
+    # spaces and could not read escaped CJK names, so those dirs were never byte-checked.
+    list_top_dirs > "${WORK_DIR}/topdirs.bin"
+    LIST_RC=$?
+    check_term
+    [ "$LIST_RC" -eq 0 ] || die "Tier 2: cannot list top-level dirs (rsync rc=$LIST_RC)" "$LIST_RC"
 
-    : > "${WORK_DIR}/slice.txt"
-    while read -r d; do
-        [ -n "$d" ] || continue
+    : > "${WORK_DIR}/slice.bin"
+    NTOP=0
+    while IFS= read -r -d '' d; do
+        NTOP=$((NTOP+1))
         H=$(printf '%s' "$d" | cksum | cut -d' ' -f1)
-        [ $(( H % VERIFY_SLICES )) -eq "$SLICE" ] && printf '%s\n' "$d" >> "${WORK_DIR}/slice.txt"
-    done < "${WORK_DIR}/topdirs.txt"
+        [ $(( H % VERIFY_SLICES )) -eq "$SLICE" ] && printf '%s\0' "$d" >> "${WORK_DIR}/slice.bin"
+    done < "${WORK_DIR}/topdirs.bin"
 
-    SLICE_N=$(wc -l < "${WORK_DIR}/slice.txt" | tr -d ' ')
-    log "Tier 2: $SLICE_N of $(wc -l < "${WORK_DIR}/topdirs.txt" | tr -d ' ') top-level dirs in this slice"
+    SLICE_N=$(tr -cd '\0' < "${WORK_DIR}/slice.bin" | wc -c | tr -d ' ')
+    log "Tier 2: $SLICE_N of $NTOP top-level dirs in this slice"
 
     CK_DRIFT=0; CK_CHECKED=0
-    while read -r d; do
-        [ -n "$d" ] || continue
-        rsync $BASE_FLAGS --checksum "${REMOTE_URL}/${d}/" "${LOCAL_NAS_PATH}/${d}/" \
-            > "${WORK_DIR}/ck.out" 2>/dev/null
+    while IFS= read -r -d '' d; do
+        # v3.16: the name goes through --files-from --from0, never into a remote path (the
+        # daemon glob-expands paths: "a[1]" was compared against "a1"). Errors are no longer
+        # discarded — a check that silently compares nothing is worse than a failed one.
+        printf '%s\0' "$d" \
+            | rsync $BASE_FLAGS --checksum -r --from0 --files-from=- "${REMOTE_URL}/" "${LOCAL_NAS_PATH}/" \
+                > "${WORK_DIR}/ck.out" 2> "${WORK_DIR}/ck.err"
+        RC=${PIPESTATUS[1]}
+        check_term
+        case "$RC" in
+            0|24) ;;
+            23)   log "WARN: rc=23 checking $(printf '%q' "$d") (usually: removed between listing and checking): $(head -1 "${WORK_DIR}/ck.err")" ;;
+            *)    log_error "rsync failed checking $(printf '%q' "$d") (rc=$RC)"
+                  sed -n '1,20p' "${WORK_DIR}/ck.err" >&2
+                  die "verify aborted" "$RC" ;;
+        esac
         n=$(count_drift "${WORK_DIR}/ck.out")
         c=$(wc -l < "${WORK_DIR}/ck.out" | tr -d ' ')
-        [ "$n" -gt 0 ] && log "  drift in $d: $n"
+        [ "$n" -gt 0 ] && log "  drift in $(printf '%q' "$d"): $n"
         CK_DRIFT=$(( CK_DRIFT + n ))
         CK_CHECKED=$(( CK_CHECKED + c ))
-    done < "${WORK_DIR}/slice.txt"
+    done < "${WORK_DIR}/slice.bin"
 
     log "Tier 2: drift=$CK_DRIFT of $CK_CHECKED entries compared"
     DRIFT_TOTAL=$(( DRIFT_TOTAL + CK_DRIFT ))

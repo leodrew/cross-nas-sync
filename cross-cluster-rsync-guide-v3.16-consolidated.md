@@ -225,7 +225,7 @@ exec rsync --daemon --no-detach --port=${RSYNC_PORT} --log-file=/dev/stdout
 ```bash
 #!/bin/bash
 #############################################
-# Multi-Client Manifest Generator (Cluster B) — v3.15
+# Multi-Client Manifest Generator (Cluster B) — v3.16
 # ONE find walk; fan-out per-client manifests by a
 # stateless lookback window. No markers, no per-client walk.
 #
@@ -249,11 +249,21 @@ log() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"; }
 
 [ -r "$REGISTRY_FILE" ] || { log "ERROR: registry $REGISTRY_FILE not readable"; exit 1; }
 
-mkdir -p "$CLIENTS_DIR"
 NOW=$(date +%s)
+# v3.16: every temp name carries the run id. $$ alone repeats across containers.
+RUN_ID="${HOSTNAME:-unknown}-$$-${NOW}"
+
+# v3.16: one generator at a time (§4.7). Exits 75 if another run holds the lock.
+. "$(dirname "${BASH_SOURCE[0]}")/nas-sync-state-lock.sh" \
+    || { log "ERROR: nas-sync-state-lock.sh not found next to this script (§4.7)"; exit 1; }
+lock_acquire manifests
+
+mkdir -p "$CLIENTS_DIR"
+# Leftovers of crashed runs (any run id, and v3.15's unsuffixed names). Safe: we hold the lock.
+rm -f "${CLIENTS_DIR}"/*/sync-manifest.txt.tmp* "${CLIENTS_DIR}"/*/manifest.meta.tmp* 2>/dev/null
 
 log "========================================"
-log "Multi-Client Manifest Generator v3.15"
+log "Multi-Client Manifest Generator v3.16"
 log "  Source: $SOURCE_PATH | State: $STATE_DIR"
 log "  Registry: $REGISTRY_FILE"
 log "========================================"
@@ -265,7 +275,7 @@ while read -r CID HOURS _rest; do
     case "$HOURS" in ''|*[!0-9]*) log "WARN: bad lookback for '$CID' ('$HOURS') — skipping"; continue;; esac
     THRESH=$(( NOW - HOURS * 3600 ))
     mkdir -p "${CLIENTS_DIR}/${CID}"
-    : > "${CLIENTS_DIR}/${CID}/sync-manifest.txt.tmp"
+    : > "${CLIENTS_DIR}/${CID}/sync-manifest.txt.tmp.${RUN_ID}"
     CLIENT_IDS+=("$CID"); THRESHOLDS+=("$THRESH")
     log "  client=$CID lookback=${HOURS}h threshold=$THRESH"
 done < "$REGISTRY_FILE"
@@ -277,7 +287,7 @@ AWK_CONF="$(mktemp)"
 i=0
 while [ "$i" -lt "${#CLIENT_IDS[@]}" ]; do
     printf '%s\t%s\t%s\n' "${CLIENT_IDS[$i]}" "${THRESHOLDS[$i]}" \
-        "${CLIENTS_DIR}/${CLIENT_IDS[$i]}/sync-manifest.txt.tmp" >> "$AWK_CONF"
+        "${CLIENTS_DIR}/${CLIENT_IDS[$i]}/sync-manifest.txt.tmp.${RUN_ID}" >> "$AWK_CONF"
     i=$((i+1))
 done
 
@@ -310,22 +320,37 @@ find "$SOURCE_PATH" \
 
 rm -f "$AWK_CONF"
 
-# Publish atomically + write meta.
+# Publish atomically + write meta. v3.16: meta is written to a temp name and renamed too,
+# and a failed publish is an error (v3.15 logged "wrote" even when mv had failed).
+FAILED=0
 i=0
 while [ "$i" -lt "${#CLIENT_IDS[@]}" ]; do
     CID="${CLIENT_IDS[$i]}"
-    TMP="${CLIENTS_DIR}/${CID}/sync-manifest.txt.tmp"
+    TMP="${CLIENTS_DIR}/${CID}/sync-manifest.txt.tmp.${RUN_ID}"
     FINAL="${CLIENTS_DIR}/${CID}/sync-manifest.txt"
+    META_TMP="${CLIENTS_DIR}/${CID}/manifest.meta.tmp.${RUN_ID}"
     COUNT=$(wc -l < "$TMP" 2>/dev/null | tr -d ' '); [ -n "$COUNT" ] || COUNT=0
-    mv -f "$TMP" "$FINAL"
-    printf 'generated_at=%s\nwindow_threshold_epoch=%s\nfile_count=%s\n' \
-        "$NOW" "${THRESHOLDS[$i]}" "$COUNT" > "${CLIENTS_DIR}/${CID}/manifest.meta"
-    log "  wrote $FINAL ($COUNT files)"
+    if mv -f "$TMP" "$FINAL"; then
+        printf 'generated_at=%s\nwindow_threshold_epoch=%s\nfile_count=%s\n' \
+            "$NOW" "${THRESHOLDS[$i]}" "$COUNT" > "$META_TMP" \
+            && mv -f "$META_TMP" "${CLIENTS_DIR}/${CID}/manifest.meta"
+        log "  wrote $FINAL ($COUNT files)"
+    else
+        log "ERROR: could not publish $FINAL"
+        FAILED=1
+    fi
     i=$((i+1))
 done
 
+[ "$FAILED" -eq 0 ] || exit 1
 log "Done."
 ```
+
+> **One generator at a time (v3.16).** The script takes the `manifests` lock (§4.7) before it
+> writes anything. A second run — typically a manual `kubectl create job --from=cronjob/…`
+> while the scheduled one is still walking — exits **75** and changes nothing; re-run it after
+> the first finishes. Every temp file carries the run id and `manifest.meta` is renamed into
+> place, so even a wrongly broken lock cannot tear a published manifest.
 
 ### 4.4 File: `cluster-b/scripts/Dockerfile` (CRLF-safe)
 
@@ -353,19 +378,23 @@ RUN mkdir -p /mnt/nas-source
 COPY entrypoint.sh /entrypoint.sh
 COPY generate-manifests.sh /userapp/scripts/generate-manifests.sh
 COPY generate-chunks.sh /userapp/scripts/generate-chunks.sh
+COPY nas-sync-state-lock.sh /userapp/scripts/nas-sync-state-lock.sh
 
 # CRLF-safe: strip carriage returns, set executable
 RUN dos2unix /entrypoint.sh \
         /userapp/scripts/generate-manifests.sh \
         /userapp/scripts/generate-chunks.sh \
+        /userapp/scripts/nas-sync-state-lock.sh \
     && chmod +x /entrypoint.sh \
         /userapp/scripts/generate-manifests.sh \
-        /userapp/scripts/generate-chunks.sh
+        /userapp/scripts/generate-chunks.sh \
+        /userapp/scripts/nas-sync-state-lock.sh
 
 # Fail build if any CRLF remains
 RUN for f in /entrypoint.sh \
              /userapp/scripts/generate-manifests.sh \
-             /userapp/scripts/generate-chunks.sh; do \
+             /userapp/scripts/generate-chunks.sh \
+             /userapp/scripts/nas-sync-state-lock.sh; do \
         if head -1 "$f" | grep -q $'\r'; then \
             echo "ERROR: CRLF in $f" && exit 1; \
         fi; \
@@ -387,7 +416,7 @@ ENTRYPOINT ["/entrypoint.sh"]
 ```bash
 cd cluster-b/scripts
 # Clean local CRLF first (belt and suspenders)
-sed -i 's/\r$//' entrypoint.sh generate-manifests.sh generate-chunks.sh 2>/dev/null || true
+sed -i 's/\r$//' entrypoint.sh generate-manifests.sh generate-chunks.sh nas-sync-state-lock.sh 2>/dev/null || true
 
 docker build -t ${REGISTRY}/nas-sync-server:3.16 .
 docker push ${REGISTRY}/nas-sync-server:3.16
@@ -407,11 +436,11 @@ docker push ${REGISTRY}/nas-sync-server:3.16
 ```bash
 #!/bin/bash
 #############################################
-# Chunk Generator (Cluster B) — v3.15
+# Chunk Generator (Cluster B) — v3.16
 # Full-tree file list split round-robin into
 # CHUNK_COUNT equal-count lists, consumed by the
 # client's chunked parallel reconcile via
-# rsync --files-from=chunk-NNN.txt.
+# rsync --files-from=chunk-<gen>-NNN.txt.
 # Shared by ALL targets: common/chunks/
 #############################################
 set +e
@@ -426,21 +455,29 @@ log() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"; }
 case "$CHUNK_COUNT" in ''|*[!0-9]*) log "ERROR: CHUNK_COUNT must be numeric"; exit 1;; esac
 [ "$CHUNK_COUNT" -ge 1 ] || { log "ERROR: CHUNK_COUNT must be >= 1"; exit 1; }
 
-TMP_DIR="${STATE_DIR}/common/.chunks.tmp"
-OLD_DIR="${STATE_DIR}/common/.chunks.old"
-
-log "========================================"
-log "Chunk Generator v3.15"
-log "  Source: $SOURCE_PATH"
-log "  Chunks: $CHUNKS_DIR (count=$CHUNK_COUNT)"
-log "========================================"
-
-# Hygiene: drop orphan dirs from a crashed run.
-# Safe because the CronJob uses concurrencyPolicy: Forbid (no concurrent run).
-rm -rf "$TMP_DIR" "$OLD_DIR"
-mkdir -p "$TMP_DIR" || { log "ERROR: cannot create $TMP_DIR (source NAS writable?)"; exit 1; }
-
 NOW=$(date +%s)
+# v3.16: every temp name carries the run id. $$ alone repeats across containers.
+RUN_ID="${HOSTNAME:-unknown}-$$-${NOW}"
+# v3.16: the generation names every chunk file (chunk-<GEN>-NNN.txt) — see the swap below.
+GEN="g${NOW}"
+TMP_DIR="${STATE_DIR}/common/.chunks.tmp.${RUN_ID}"
+OLD_DIR="${STATE_DIR}/common/.chunks.old.${RUN_ID}"
+
+# v3.16: one generator at a time (§4.7). Exits 75 if another run holds the lock.
+. "$(dirname "${BASH_SOURCE[0]}")/nas-sync-state-lock.sh" \
+    || { log "ERROR: nas-sync-state-lock.sh not found next to this script (§4.7)"; exit 1; }
+lock_acquire chunks
+
+log "========================================"
+log "Chunk Generator v3.16"
+log "  Source: $SOURCE_PATH"
+log "  Chunks: $CHUNKS_DIR (count=$CHUNK_COUNT, generation=$GEN)"
+log "========================================"
+
+# Hygiene: drop orphan dirs from crashed runs (any run id, and v3.15's unsuffixed names).
+# Safe because we hold the lock — no other generator is writing.
+rm -rf "${STATE_DIR}/common"/.chunks.tmp* "${STATE_DIR}/common"/.chunks.old*
+mkdir -p "$TMP_DIR" || { log "ERROR: cannot create $TMP_DIR (source NAS writable?)"; exit 1; }
 
 # Same prune set as the manifest generator (§4.3): snapshot dirs at EVERY depth.
 log "Walking source (one pass)..."
@@ -451,12 +488,13 @@ find "$SOURCE_PATH" \
     -name '@eaDir'     -prune -o \
     -path "$STATE_DIR" -prune -o \
     \( -type f -o -type l \) -printf '%P\n' 2>/dev/null \
-| split -n "r/${CHUNK_COUNT}" -d -a 3 - "${TMP_DIR}/chunk-"
+| split -n "r/${CHUNK_COUNT}" -d -a 3 - "${TMP_DIR}/chunk-${GEN}-"
 # split -n r/N = round-robin by line, works on a pipe (no need to know the total first).
 # Round-robin also spreads any directory hot-spot evenly across chunks.
+# split -n always creates exactly N files (some empty if the tree is tiny).
 
 TOTAL=0
-for f in "${TMP_DIR}"/chunk-*; do
+for f in "${TMP_DIR}/chunk-${GEN}-"*; do
     [ -f "$f" ] || continue
     mv -f "$f" "${f}.txt"
     N=$(wc -l < "${f}.txt" 2>/dev/null | tr -d ' '); [ -n "$N" ] || N=0
@@ -469,11 +507,15 @@ if [ "$TOTAL" -eq 0 ]; then
     exit 1
 fi
 
-printf 'generated_at=%s\nchunk_count=%s\ntotal_files=%s\n' \
-    "$NOW" "$CHUNK_COUNT" "$TOTAL" > "${TMP_DIR}/chunks.meta"
+printf 'generated_at=%s\ngeneration=%s\nchunk_count=%s\ntotal_files=%s\n' \
+    "$NOW" "$GEN" "$CHUNK_COUNT" "$TOTAL" > "${TMP_DIR}/chunks.meta"
 
-# Swap into place. Clients fetch the whole dir in one rsync, so the worst case during
-# the swap is one failed fetch — the client then falls back to the top-level split (§8.3).
+# Swap into place. The two mv calls leave a brief window with no chunks dir: a client
+# fetch that starts in it fails and falls back (§8.3). A fetch already IN FLIGHT across
+# the swap is the subtle case — rsync re-resolves each file by path, so with fixed names
+# it would silently get a MIX of old and new chunks (rc=0). Generation-unique names make
+# the old names vanish instead: the fetch fails with rc 24, and the client retries or
+# falls back. It can never receive a mixed set.
 if [ -d "$CHUNKS_DIR" ]; then
     mv -f "$CHUNKS_DIR" "$OLD_DIR" || { log "ERROR: cannot rotate old chunks"; exit 1; }
 fi
@@ -481,14 +523,136 @@ mkdir -p "$(dirname "$CHUNKS_DIR")"
 mv -f "$TMP_DIR" "$CHUNKS_DIR" || { log "ERROR: cannot publish chunks"; exit 1; }
 rm -rf "$OLD_DIR"
 
-log "Published $CHUNK_COUNT chunks, $TOTAL files total → $CHUNKS_DIR"
+log "Published $CHUNK_COUNT chunks (generation $GEN), $TOTAL files total → $CHUNKS_DIR"
 log "Done."
 ```
 
+> **Generation-named chunks (v3.16).** Every file is `chunk-<generation>-NNN.txt` and
+> `chunks.meta` records `generation=`. A client fetch that overlaps the swap therefore fails
+> with rc 24 instead of silently receiving a mix of two generations (which left ~22% of the
+> tree unreconciled); the client retries once, then falls back (§8.3). v3.15 clients still
+> match the new names with `chunk-*.txt`, so this is safe to roll out source-first.
+>
 > **Disk cost.** At 7.4M paths the chunk lists total a few hundred MB on the source NAS under
 > `.nas-sync-state/common/chunks/`. That path is already excluded client-side (§9A.1), so it is
 > never replicated. To reclaim it if you stop using chunked reconcile:
 > `rm -rf /mnt/nas-source/.nas-sync-state/common/chunks` from a server pod.
+
+### 4.7 File: `cluster-b/scripts/nas-sync-state-lock.sh` (v3.16)
+
+> Write this file **before** running §4.5 — it is in the Dockerfile's COPY and CRLF-guard
+> lists (§4.4). Section order is kept stable; build order is §4.6, §4.7, then §4.5.
+>
+> Sourced by both generators (§4.3, §4.6). `concurrencyPolicy: Forbid` stops the CronJob
+> controller from starting a second *scheduled* run, but it is not a lock: a manual
+> `kubectl create job --from=cronjob/…` (the runbook uses these in S1, S2, S4 and S9) or a
+> replacement pod still overlaps the scheduled one, and two overlapping generators tear the
+> manifest and publish a half-written chunk set. With this library the second run exits
+> **75** without touching anything and logs who holds the lock.
+
+```bash
+#!/bin/bash
+#############################################
+# State-dir lock library (Cluster B) — v3.16
+# Sourced by generate-manifests.sh (§4.3) and
+# generate-chunks.sh (§4.6). One lock per job.
+#
+# concurrencyPolicy: Forbid is NOT a lock. A
+# `kubectl create job --from=cronjob/…` run (the
+# runbook uses these), or a replacement pod,
+# overlaps the scheduled run. Two overlapping
+# generators tear the manifest and publish a
+# half-written chunk set.
+#
+# mkdir is atomic on every NFS version. flock is
+# NOT used: the pods run on different nodes, and
+# on a `nolock` NFS mount flock is silently local.
+#
+# Caller provides: STATE_DIR, log(). Do not set
+# your own EXIT trap after lock_acquire — it owns
+# EXIT to release the lock.
+#############################################
+
+LOCK_HEARTBEAT="${LOCK_HEARTBEAT:-60}"   # seconds between heartbeat touches
+LOCK_STALE="${LOCK_STALE:-600}"          # a heartbeat older than this = holder is dead
+LOCK_EXIT_HELD=75                        # EX_TEMPFAIL: "another run holds the lock"
+LOCK_RUN_ID="${RUN_ID:-${HOSTNAME:-unknown}-$$-$(date +%s)}"
+LOCK_PATH=""
+LOCK_HB_PID=""
+
+# "Now" by the NAS clock. Pod clocks are never compared with NAS mtimes: touch a probe
+# in the same directory and read its mtime back.
+_lock_nas_now() {
+    local probe="${STATE_DIR}/locks/.probe.${LOCK_RUN_ID}" t
+    touch "$probe" 2>/dev/null || return 1
+    t=$(stat -c %Y "$probe" 2>/dev/null)
+    rm -f "$probe"
+    [ -n "$t" ] && echo "$t"
+}
+
+# Seconds since the lock's last heartbeat (its dir mtime if the heartbeat file is missing).
+_lock_age() {
+    local now hb
+    now=$(_lock_nas_now) || { echo 999999999; return; }
+    hb=$(stat -c %Y "$1/heartbeat" 2>/dev/null || stat -c %Y "$1" 2>/dev/null) || { echo 999999999; return; }
+    echo $(( now - hb ))
+}
+
+lock_release() {
+    [ -n "$LOCK_HB_PID" ] && kill "$LOCK_HB_PID" 2>/dev/null
+    [ -n "$LOCK_PATH" ] || return 0
+    # Only remove the lock if it is still ours (it may have been broken as stale).
+    grep -qx "run_id=${LOCK_RUN_ID}" "${LOCK_PATH}/owner" 2>/dev/null && rm -rf "$LOCK_PATH"
+    return 0
+}
+
+# lock_acquire <name>: returns 0 holding the lock, or EXITS 75 (lock held) / 1 (cannot lock).
+lock_acquire() {
+    local name="$1" attempt age owner stale_dir
+    mkdir -p "${STATE_DIR}/locks" || { log "ERROR: cannot create ${STATE_DIR}/locks (source NAS writable?)"; exit 1; }
+    LOCK_PATH="${STATE_DIR}/locks/${name}.lock"
+    for attempt in 1 2; do
+        if mkdir "$LOCK_PATH" 2>/dev/null; then
+            printf 'run_id=%s\nhost=%s\npid=%s\nstarted=%s\n' \
+                "$LOCK_RUN_ID" "${HOSTNAME:-unknown}" "$$" "$(date +%s)" > "${LOCK_PATH}/owner"
+            touch "${LOCK_PATH}/heartbeat"
+            ( while sleep "$LOCK_HEARTBEAT"; do touch "${LOCK_PATH}/heartbeat" 2>/dev/null || exit 0; done ) &
+            LOCK_HB_PID=$!
+            trap lock_release EXIT
+            log "Lock '${name}' acquired (run_id=${LOCK_RUN_ID})"
+            return 0
+        fi
+        [ -d "$LOCK_PATH" ] || continue            # released between our mkdir and now: retry
+        owner=$(cat "${LOCK_PATH}/owner" 2>/dev/null)
+        age=$(_lock_age "$LOCK_PATH")
+        if [ "$age" -le "$LOCK_STALE" ]; then
+            log "ERROR: lock '${name}' held by [$(printf '%s' "$owner" | tr '\n' ' ')] (heartbeat ${age}s ago) — another run is in progress; this run did nothing. Re-run after it finishes."
+            exit "$LOCK_EXIT_HELD"
+        fi
+        log "WARN: lock '${name}' is stale (heartbeat ${age}s ago > ${LOCK_STALE}s; owner [$(printf '%s' "$owner" | tr '\n' ' ')]) — breaking it"
+        # Rename is atomic: exactly one contender moves the stale lock away.
+        stale_dir="${LOCK_PATH}.stale.${LOCK_RUN_ID}"
+        mv "$LOCK_PATH" "$stale_dir" 2>/dev/null \
+            || { log "ERROR: another run broke lock '${name}' first; this run did nothing"; exit "$LOCK_EXIT_HELD"; }
+        if [ "$(cat "${stale_dir}/owner" 2>/dev/null)" != "$owner" ]; then
+            # We moved a FRESH lock that another run took after breaking the stale one: put it back.
+            mv -T "$stale_dir" "$LOCK_PATH" 2>/dev/null || log "WARN: could not restore lock '${name}' moved by mistake"
+            log "ERROR: another run broke lock '${name}' first; this run did nothing"
+            exit "$LOCK_EXIT_HELD"
+        fi
+        rm -rf "$stale_dir"
+    done
+    log "ERROR: could not take lock '${name}'; this run did nothing"
+    exit "$LOCK_EXIT_HELD"
+}
+```
+
+> **Layout and recovery.** `.nas-sync-state/locks/<job>.lock/` holds `owner` and a
+> `heartbeat` file the holder touches every `LOCK_HEARTBEAT` (60s). A lock whose heartbeat is
+> older than `LOCK_STALE` (600s) belongs to a dead run — SIGKILL, node loss,
+> `activeDeadlineSeconds` — and the next run breaks it automatically. A fixed TTL would not
+> work: a walk may legitimately run for up to 24h. Ages are measured on the NAS clock, never
+> against pod clocks. The path is under `.nas-sync-state/`, so it is never replicated.
 
 ---
 
@@ -764,6 +928,8 @@ metadata:
 spec:
   # Run ~10 min BEFORE the most-frequent client incremental sync.
   schedule: "50 */2 * * *"
+  # Forbid only stops the controller overlapping its OWN scheduled runs. Manual
+  # `create job --from` runs are serialized by the script's lock (§4.7).
   concurrencyPolicy: Forbid
   successfulJobsHistoryLimit: 3
   failedJobsHistoryLimit: 3
@@ -850,6 +1016,8 @@ metadata:
 spec:
   # Weekly, ~2h before the client's weekly reconcile (§9A.4 runs Sun 02:00).
   schedule: "0 0 * * 0"
+  # Forbid only stops the controller overlapping its OWN scheduled runs. Manual
+  # `create job --from` runs are serialized by the script's lock (§4.7).
   concurrencyPolicy: Forbid
   startingDeadlineSeconds: 3600
   successfulJobsHistoryLimit: 3
@@ -897,6 +1065,12 @@ spec:
 # Only if using chunked parallel reconcile:
 kubectl apply -f cluster-b/cronjob-chunks.yaml
 ```
+
+> **Overlap with the manifest job (v3.16 note).** On Sundays this walk runs alongside the
+> `:50` manifest runs (§6.1). That is safe — the two jobs write disjoint paths and each takes
+> only its own lock (§4.7) — but it doubles metadata load on the source NAS while both walk.
+> If that load matters, move this schedule to a quiet window that still ends before the
+> reconcile (§9A.4).
 
 ---
 
@@ -3032,7 +3206,8 @@ cluster-b/
     ├── Dockerfile                  # 4.4  (CRLF-safe)
     ├── entrypoint.sh              # 4.2
     ├── generate-manifests.sh      # 4.3  (incremental only: multi-client fan-out)
-    └── generate-chunks.sh         # 4.6  (v3.15, optional: equal-count chunk lists)
+    ├── generate-chunks.sh         # 4.6  (v3.15, optional: equal-count chunk lists)
+    └── nas-sync-state-lock.sh     # 4.7  (v3.16, generator lock — sourced by 4.3 + 4.6)
 
 + Patch non-route ingressgateway port 8787 (5.8)
 ```

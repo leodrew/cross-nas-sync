@@ -331,6 +331,38 @@ if want lock; then
     touch -d "@$(( $(date +%s) - 1200 ))" "$STATE_DIR/locks/chunks.lock/heartbeat" "$STATE_DIR/locks/chunks.lock"
     timeout --kill-after=10 300 "$S/generate-chunks.sh" > "$T/stale.log" 2>&1; RC=$?
     check "stale lock (heartbeat 20 min old) is broken and the run proceeds (rc=$RC)" '[ "$RC" -eq 0 ] && grep -q "stale" "$T/stale.log"'
+
+    # Fail closed: a fresh lock whose age cannot be measured (the NAS-clock probe cannot be created,
+    # e.g. a full or over-quota volume) must be treated as held, never as stale.
+    REAL_TOUCH=$(command -v touch)
+    mkdir -p "$T/notouch" "$STATE_DIR/locks/chunks.lock"
+    printf '#!/bin/bash\nfor a in "$@"; do case "$a" in *.probe.*) exit 1;; esac; done\nexec %s "$@"\n' "$REAL_TOUCH" > "$T/notouch/touch"
+    chmod +x "$T/notouch/touch"
+    printf 'run_id=live-holder\n' > "$STATE_DIR/locks/chunks.lock/owner"
+    "$REAL_TOUCH" "$STATE_DIR/locks/chunks.lock/heartbeat"
+    PATH="$T/notouch:$PATH" timeout --kill-after=10 300 "$S/generate-chunks.sh" > "$T/nomeasure.log" 2>&1; RC=$?
+    check "live lock is not broken when its age cannot be measured (exit 75) [rc=$RC]" \
+        '[ "$RC" -eq 75 ] && grep -qx "run_id=live-holder" "$STATE_DIR/locks/chunks.lock/owner" 2>/dev/null && grep -q "cannot determine the age" "$T/nomeasure.log"'
+    rm -rf "$STATE_DIR/locks/chunks.lock"
+
+    # The heartbeat must survive a transient touch error. LOCK_HEARTBEAT=1 and the throttled find (a walk
+    # of a few seconds); the shim touch fails exactly once, on the first REFRESH of an existing
+    # .../heartbeat (the initial touch creates the file and passes). Sampled >= 2.5 s after the lock was
+    # taken, the heartbeat must be newer than acquisition + 1 s: the loop went on after the failure.
+    mkdir -p "$T/hbtouch"
+    printf '#!/bin/bash\nfor a in "$@"; do case "$a" in */heartbeat)\n  if [ -e "$a" ] && [ ! -e "%s/hb.failed" ]; then : > "%s/hb.failed"; exit 1; fi;;\nesac; done\nexec %s "$@"\n' \
+        "$T" "$T" "$REAL_TOUCH" > "$T/hbtouch/touch"
+    chmod +x "$T/hbtouch/touch"
+    rm -f "$T/hb.failed"
+    LOCK_HEARTBEAT=1 PATH="$T/hbtouch:$T/slowfind:$PATH" timeout --kill-after=10 300 "$S/generate-chunks.sh" > "$T/hb.log" 2>&1 & HPID=$!
+    OWNER_F="$STATE_DIR/locks/chunks.lock/owner"
+    for _ in $(seq 1 100); do [ -e "$OWNER_F" ] && break; sleep 0.05; done
+    ACQ=$(stat -c %.3Y "$OWNER_F" 2>/dev/null || echo 0)                     # lock acquisition time (NAS clock)
+    until awk -v a="$ACQ" -v n="$(date +%s.%N)" 'BEGIN{exit !(n >= a + 2.5)}'; do sleep 0.05; done
+    HB=$(stat -c %.3Y "$STATE_DIR/locks/chunks.lock/heartbeat" 2>/dev/null || echo 0)
+    wait "$HPID"; RC=$?
+    check "heartbeat keeps running after a failed touch [rc=$RC, acquired=$ACQ, heartbeat=$HB]" \
+        '[ "$RC" -eq 0 ] && [ -e "$T/hb.failed" ] && awk -v a="$ACQ" -v h="$HB" "BEGIN{exit !(a > 0 && h > a + 1)}" && grep -q "lock heartbeat touch failed" "$T/hb.log"'
     unset SOURCE_PATH STATE_DIR REGISTRY_FILE CHUNK_COUNT
 fi
 

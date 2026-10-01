@@ -124,10 +124,16 @@ Sourced by §4.3 and §4.6. Each job has its own lock: `manifests` and `chunks`.
         `mv` means someone else won: exit 75.
      3. `rm -rf` the renamed directory;
      4. `mkdir` once more. If that fails, exit 75.
+   - **Age cannot be measured:** if the probe `touch` fails, or neither `heartbeat` nor the lock directory can be
+     stat'ed, while the lock directory exists, the contender fails closed: it treats the lock as held and
+     **exits 75**, and never breaks a lock it could not measure.
 
 **`lock_release`**
 - stop the heartbeat loop;
 - remove the lock directory **only if** `owner` still carries our `run_id`.
+
+**A failed heartbeat `touch` is not fatal.** The loop logs a WARN and tries again at the next interval, so one
+transient NFS error does not silently end the heartbeat and let a live lock age into "stale".
 
 **Why a heartbeat instead of a fixed TTL.** A walk may legitimately run for up to `activeDeadlineSeconds`
 (24 h). A TTL long enough to cover that would let one crashed run block the 2-hourly manifest job for a

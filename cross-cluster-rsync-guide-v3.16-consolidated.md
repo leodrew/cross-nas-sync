@@ -331,10 +331,14 @@ while [ "$i" -lt "${#CLIENT_IDS[@]}" ]; do
     META_TMP="${CLIENTS_DIR}/${CID}/manifest.meta.tmp.${RUN_ID}"
     COUNT=$(wc -l < "$TMP" 2>/dev/null | tr -d ' '); [ -n "$COUNT" ] || COUNT=0
     if mv -f "$TMP" "$FINAL"; then
-        printf 'generated_at=%s\nwindow_threshold_epoch=%s\nfile_count=%s\n' \
+        if printf 'generated_at=%s\nwindow_threshold_epoch=%s\nfile_count=%s\n' \
             "$NOW" "${THRESHOLDS[$i]}" "$COUNT" > "$META_TMP" \
-            && mv -f "$META_TMP" "${CLIENTS_DIR}/${CID}/manifest.meta"
-        log "  wrote $FINAL ($COUNT files)"
+            && mv -f "$META_TMP" "${CLIENTS_DIR}/${CID}/manifest.meta"; then
+            log "  wrote $FINAL ($COUNT files)"
+        else
+            log "ERROR: could not write ${CLIENTS_DIR}/${CID}/manifest.meta"
+            FAILED=1
+        fi
     else
         log "ERROR: could not publish $FINAL"
         FAILED=1
@@ -349,8 +353,9 @@ log "Done."
 > **One generator at a time (v3.16).** The script takes the `manifests` lock (§4.7) before it
 > writes anything. A second run — typically a manual `kubectl create job --from=cronjob/…`
 > while the scheduled one is still walking — exits **75** and changes nothing; re-run it after
-> the first finishes. Every temp file carries the run id and `manifest.meta` is renamed into
-> place, so even a wrongly broken lock cannot tear a published manifest.
+> the first finishes. Every temp file carries the run id, and both the manifest and
+> `manifest.meta` are renamed into place atomically, so a reader never sees a half-written
+> manifest or meta. The lock is what keeps two runs from overlapping.
 
 ### 4.4 File: `cluster-b/scripts/Dockerfile` (CRLF-safe)
 
@@ -425,7 +430,7 @@ docker push ${REGISTRY}/nas-sync-server:3.16
 ### 4.6 File: `cluster-b/scripts/generate-chunks.sh` (v3.15)
 
 > Write this file **before** running §4.5 — it is listed in the Dockerfile's COPY and
-> CRLF-guard lists (§4.4). Section order is kept stable from v3.14; build order is §4.6 then §4.5.
+> CRLF-guard lists (§4.4). Section order is kept stable from v3.14; build order is §4.6, §4.7, then §4.5.
 >
 > Used only by `parallel` mode's chunked path. Splits the whole source tree into
 > `CHUNK_COUNT` equal-count file lists so reconcile workers pull balanced slices instead of
@@ -580,6 +585,12 @@ LOCK_RUN_ID="${RUN_ID:-${HOSTNAME:-unknown}-$$-$(date +%s)}"
 LOCK_PATH=""
 LOCK_HB_PID=""
 
+# Succeeds only for a positive integer (no sign, no unit, no decimal point).
+_lock_posint() {
+    case "$1" in ''|*[!0-9]*) return 1;; esac
+    [ "$1" -gt 0 ] 2>/dev/null
+}
+
 # "Now" by the NAS clock. Pod clocks are never compared with NAS mtimes: touch a probe
 # in the same directory and read its mtime back.
 _lock_nas_now() {
@@ -587,14 +598,18 @@ _lock_nas_now() {
     touch "$probe" 2>/dev/null || return 1
     t=$(stat -c %Y "$probe" 2>/dev/null)
     rm -f "$probe"
-    [ -n "$t" ] && echo "$t"
+    case "$t" in ''|*[!0-9]*) return 1;; esac
+    echo "$t"
 }
 
 # Seconds since the lock's last heartbeat (its dir mtime if the heartbeat file is missing).
+# FAILS CLOSED: if the age cannot be measured it prints nothing and returns 1 — never a
+# made-up huge number, which the caller would take for "stale" and break a live lock.
 _lock_age() {
     local now hb
-    now=$(_lock_nas_now) || { echo 999999999; return; }
-    hb=$(stat -c %Y "$1/heartbeat" 2>/dev/null || stat -c %Y "$1" 2>/dev/null) || { echo 999999999; return; }
+    now=$(_lock_nas_now) || return 1
+    hb=$(stat -c %Y "$1/heartbeat" 2>/dev/null || stat -c %Y "$1" 2>/dev/null) || return 1
+    case "$hb" in ''|*[!0-9]*) return 1;; esac
     echo $(( now - hb ))
 }
 
@@ -608,23 +623,39 @@ lock_release() {
 
 # lock_acquire <name>: returns 0 holding the lock, or EXITS 75 (lock held) / 1 (cannot lock).
 lock_acquire() {
-    local name="$1" attempt age owner stale_dir
+    local name="$1" attempt age owner stale_dir mkerr
+    # A bad LOCK_* value must not turn into a failed test that reads as "not stale".
+    _lock_posint "$LOCK_HEARTBEAT" || { log "WARN: LOCK_HEARTBEAT='${LOCK_HEARTBEAT}' is not a positive integer — using 60"; LOCK_HEARTBEAT=60; }
+    _lock_posint "$LOCK_STALE"     || { log "WARN: LOCK_STALE='${LOCK_STALE}' is not a positive integer — using 600"; LOCK_STALE=600; }
     mkdir -p "${STATE_DIR}/locks" || { log "ERROR: cannot create ${STATE_DIR}/locks (source NAS writable?)"; exit 1; }
     LOCK_PATH="${STATE_DIR}/locks/${name}.lock"
     for attempt in 1 2; do
-        if mkdir "$LOCK_PATH" 2>/dev/null; then
+        if mkerr=$(mkdir "$LOCK_PATH" 2>&1); then
             printf 'run_id=%s\nhost=%s\npid=%s\nstarted=%s\n' \
                 "$LOCK_RUN_ID" "${HOSTNAME:-unknown}" "$$" "$(date +%s)" > "${LOCK_PATH}/owner"
             touch "${LOCK_PATH}/heartbeat"
-            ( while sleep "$LOCK_HEARTBEAT"; do touch "${LOCK_PATH}/heartbeat" 2>/dev/null || exit 0; done ) &
+            # A failed touch (transient NFS error) must not end the loop: it warns and retries next interval.
+            ( while sleep "$LOCK_HEARTBEAT"; do
+                  touch "${LOCK_PATH}/heartbeat" 2>/dev/null \
+                      || echo "$(date '+%Y-%m-%d %H:%M:%S') - WARN: lock heartbeat touch failed (${LOCK_PATH}/heartbeat); retrying in ${LOCK_HEARTBEAT}s" >&2
+              done ) &
             LOCK_HB_PID=$!
             trap lock_release EXIT
             log "Lock '${name}' acquired (run_id=${LOCK_RUN_ID})"
             return 0
         fi
-        [ -d "$LOCK_PATH" ] || continue            # released between our mkdir and now: retry
+        if [ ! -d "$LOCK_PATH" ]; then
+            # mkdir failed but nothing holds the name: this is not "held". Retry once, then say why.
+            [ "$attempt" -lt 2 ] && continue
+            log "ERROR: cannot create lock '${name}' (${mkerr}) — source NAS read-only or out of quota? This run did nothing."
+            exit 1
+        fi
         owner=$(cat "${LOCK_PATH}/owner" 2>/dev/null)
-        age=$(_lock_age "$LOCK_PATH")
+        if ! age=$(_lock_age "$LOCK_PATH"); then
+            [ -d "$LOCK_PATH" ] || continue        # released while we looked: retry
+            log "ERROR: cannot determine the age of lock '${name}' (NAS-clock probe or stat failed; owner [$(printf '%s' "$owner" | tr '\n' ' ')]) — treating it as held; this run did nothing."
+            exit "$LOCK_EXIT_HELD"
+        fi
         if [ "$age" -le "$LOCK_STALE" ]; then
             log "ERROR: lock '${name}' held by [$(printf '%s' "$owner" | tr '\n' ' ')] (heartbeat ${age}s ago) — another run is in progress; this run did nothing. Re-run after it finishes."
             exit "$LOCK_EXIT_HELD"

@@ -1749,6 +1749,7 @@ RC=$WAIT_RC
 # Read GOT_TERM ONCE. A TERM that lands later must not make one line say exit=0 and the next
 # say interrupted: everything below uses INTERRUPTED, never GOT_TERM.
 INTERRUPTED=$GOT_TERM
+trap '' TERM INT    # the mode script is done: a late group TERM must not kill date/hostname/mv below
 # An interrupted run is never a success, whatever the mode script returned.
 [ -n "$INTERRUPTED" ] && [ "$RC" -eq 0 ] && RC=143
 ELAPSED=$(( $(date +%s) - START ))
@@ -2303,14 +2304,16 @@ list_top_dirs() {
     return "$rc"
 }
 
-# wait_child <pid>: sets WAIT_RC to the child's real exit status. A trapped signal makes
+# wait_child <pid>: sets WAIT_RC to the child's exit status. A trapped signal makes
 # `wait` return early (>128) while the child is still running — keep waiting until it is
 # gone. A shell that exits before its children unwinds the chain up to tini (PID 1), and
 # the kernel then SIGKILLs rsync before it can save its partial file.
 # If the child exits while a trap is running, bash reaps it inside the handler and that
-# `wait` returns 128+signal, not the child's status. bash keeps the reaped child's status, so
-# once the child is gone one more `wait` returns it; 127 means nothing was kept — then the
-# first value is all there is.
+# `wait` returns 128+signal, not the child's status. bash usually keeps the reaped child's
+# status, so once the child is gone one more `wait` returns it. This is best effort: when bash
+# has lost the child's status (127 = nothing kept, -1 = bash's internal value when a second
+# trapped signal interrupts the reap) the interrupt status is kept. An interrupted mode
+# script exits 143 anyway, so the result is the same.
 wait_child() {
     local r r2
     while :; do
@@ -2318,7 +2321,7 @@ wait_child() {
         [ "$r" -le 128 ] && { WAIT_RC=$r; return; }
         kill -0 "$1" 2>/dev/null && continue
         wait "$1" 2>/dev/null; r2=$?
-        [ "$r2" -eq 127 ] && r2=$r
+        case "$r2" in 127|-1) r2=$r ;; esac
         WAIT_RC=$r2; return
     done
 }

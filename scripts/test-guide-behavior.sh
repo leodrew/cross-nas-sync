@@ -427,14 +427,56 @@ if want signal; then
     # SIGTERM while the pre-flight is still running (a slow `mountpoint` on a stale NFS mount): the
     # signal only sets a flag, so the mode script must check it before it starts rsync. ~2 MB/s
     # keeps an rsync that wrongly starts running past the 60 s the helper waits, so it would be
-    # SIGKILLed mid-file and leave its temp file behind.
+    # SIGKILLed mid-file and leave its temp file behind. The SIGTERM comes 2 s in and the shim
+    # lasts 6 s: the chain has 2 s to reach the shim, and the signal still lands 4 s before it ends.
     mkdir -p "$T/shim-mp"
-    printf '%s\n' '#!/bin/bash' 'sleep 5' 'exit 0' > "$T/shim-mp/mountpoint"; chmod +x "$T/shim-mp/mountpoint"
+    printf '%s\n' '#!/bin/bash' 'sleep 6' 'exit 0' > "$T/shim-mp/mountpoint"; chmod +x "$T/shim-mp/mountpoint"
     shim_set 2000
     DST=$(fresh_dst "sig-preflight")
-    PATH="$T/shim-mp:$T/shim:$PATH" SYNC_MODE=standard LOCAL_NAS_PATH="$DST" ISTIO_ADMIN_PORT=1 SIG_AFTER=1 \
+    PATH="$T/shim-mp:$T/shim:$PATH" SYNC_MODE=standard LOCAL_NAS_PATH="$DST" ISTIO_ADMIN_PORT=1 SIG_AFTER=2 \
         sigterm_run "SIGTERM during pre-flight" "$DST" "$T/sig-preflight.log" "-g" -- "$S/run-with-sidecar-quit.sh"
+    BLOBS=$(find "$DST" -name '.blob*' | wc -l)
+    check "SIGTERM during pre-flight: rsync never started (no .blob* file in the target, found $BLOBS)" '[ "$BLOBS" -eq 0 ]'
     shim_off
+
+    # The same stop, 25 times, in the fast-exit case. Under `tini -g` the dispatcher gets two TERMs within milliseconds
+    # (tini's group TERM, then the wrapper's own `kill -TERM 0`) while its `wait` is running. When
+    # the mode script exits at that same moment, wait_child has to keep a usable status: the
+    # container must exit 143 and last-run must end with a well-formed
+    # `exit=143 elapsed=<digits>s ... interrupted=TERM`, never `exit=-1`, exit 255 or an empty
+    # elapsed. Each run: wrapper -> dispatcher -> standard mode, tini -g as PID 1.
+    # The stall is the pre-flight RETRY SLEEP (REMOTE_PORT closed, PREFLIGHT_WAIT=30), not a slow
+    # `mountpoint`: that runs under `timeout`, which gives it its own process group, so the group
+    # TERM never reaches it and the mode script only exits when the shim ends, seconds after the
+    # signals. A foreground `sleep` in the pre-flight does get the group TERM, so the mode script
+    # exits within milliseconds of the two TERMs - the window the race needs (about a third of
+    # the runs fail on a dispatcher without the v3.16 round-2 fixes: exit 255 from
+    # `exit=-1`, or a negative elapsed because a late group TERM killed `date`).
+    # SIGTERM goes in 1 s after the start.
+    DST=$(fresh_dst "sig-loop")
+    LOOP_N=25; LOOP_OK=0; LOOP_BAD=""
+    for i in $(seq 1 "$LOOP_N"); do
+        rm -rf "$DST/.nas-sync-status"
+        SYNC_MODE=standard LOCAL_NAS_PATH="$DST" ISTIO_ADMIN_PORT=1 REMOTE_PORT=1 PREFLIGHT_RETRIES=5 PREFLIGHT_WAIT=30 \
+            unshare --pid --fork --mount-proc tini -g -- "$S/run-with-sidecar-quit.sh" > "$T/sig-loop-$i.log" 2>&1 &
+        u=$!
+        sleep 1
+        tpid=$(pgrep -P "$u" -x tini | head -n 1)
+        [ -n "$tpid" ] && kill -TERM "$tpid"
+        for _ in $(seq 1 200); do kill -0 "$u" 2>/dev/null || break; sleep 0.1; done
+        if kill -0 "$u" 2>/dev/null; then
+            kill -KILL "$tpid" 2>/dev/null; kill -KILL "$u" 2>/dev/null; echo "(killed after 20s)" >> "$T/sig-loop-$i.log"
+        fi
+        wait "$u" 2>/dev/null; loop_rc=$?
+        if [ "$loop_rc" -eq 143 ] \
+           && grep -Eq ' exit=143 elapsed=[0-9]+s .* interrupted=TERM$' "$DST/.nas-sync-status/last-run" 2>/dev/null; then
+            LOOP_OK=$((LOOP_OK+1))
+        else
+            LOOP_BAD="$LOOP_BAD $i(rc=$loop_rc)"
+        fi
+    done
+    check "SIGTERM during pre-flight, $LOOP_N runs under tini -g: $LOOP_OK/$LOOP_N runs exited 143 with a valid status line${LOOP_BAD:+ — failed:$LOOP_BAD}" \
+        '[ "$LOOP_OK" -eq "$LOOP_N" ]'
 fi
 
 # ================================================================ deploy (--slow)

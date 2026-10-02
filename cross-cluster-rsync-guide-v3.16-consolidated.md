@@ -1899,9 +1899,14 @@ exit $SYNC_EXIT
 #############################################
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"; }
 
-CRON_SCHEDULE="${CRON_SCHEDULE:-0 */2 * * *}"
+# v3.16: shared helpers (§8.11) — wait_child.
+. "$(dirname "${BASH_SOURCE[0]}")/nas-sync-lib.sh" || { log "ERROR: nas-sync-lib.sh not found (§8.11)"; exit 1; }
 
-log "=== NAS Sync Client v3.15 (Deployment, SYNC_MODE=${SYNC_MODE:-standard}) ==="
+CRON_SCHEDULE="${CRON_SCHEDULE:-0 */2 * * *}"
+# Keep below terminationGracePeriodSeconds (§10B.1): time allowed for in-flight runs to stop.
+SHUTDOWN_WAIT="${SHUTDOWN_WAIT:-50}"
+
+log "=== NAS Sync Client v3.16 (Deployment, SYNC_MODE=${SYNC_MODE:-standard}) ==="
 log "Cron: ${CRON_SCHEDULE}"
 log "Client: ${CLIENT_ID:-<unset>}"
 
@@ -1929,11 +1934,43 @@ EOF
 chmod 0644 /etc/cron.d/nas-sync
 log "OK Cron configured (/etc/cron.d/nas-sync, flock-guarded)"
 
-log "=== INITIAL SYNC (no time limit) ==="
-flock -n /var/lock/nas-sync.lock /userapp/scripts/dispatch-sync.sh
-log "Initial sync done (exit $?). Starting cron..."
+# v3.16: this shell stays tini's child for the pod's whole life — no `exec cron -f`. On
+# SIGTERM it stops cron, signals every in-flight run, and waits for them to finish. cron
+# gives each job its OWN session, so `tini -g` never reached cron-launched runs: in v3.15
+# they were SIGKILLed mid-transfer whenever the pod was deleted or rolled.
+GOT_TERM=""
+CRON_PID=""
+# Process groups of all running syncs: the initial sync (ours) and each cron job's.
+run_pgids() { ps -eo pgid=,args= | awk '/\/userapp\/scripts\/dispatch-sync\.sh/ {print $1}' | sort -u; }
+on_term() {
+    [ -n "$GOT_TERM" ] && return     # signalling our own group re-enters this trap
+    GOT_TERM=1
+    log "SIGTERM — stopping cron, signalling in-flight sync runs"
+    [ -n "$CRON_PID" ] && kill -TERM "$CRON_PID" 2>/dev/null
+    local pg
+    for pg in $(run_pgids); do kill -TERM -- "-$pg" 2>/dev/null; done
+}
+trap on_term TERM INT
+drain_and_exit() {
+    local i=0
+    while [ "$i" -lt "$SHUTDOWN_WAIT" ] && [ -n "$(run_pgids)" ]; do sleep 1; i=$((i+1)); done
+    [ -n "$(run_pgids)" ] && log "WARN: a sync is still running after ${SHUTDOWN_WAIT}s — it will be SIGKILLed"
+    log "=== Shutdown complete ==="
+    exit 143
+}
 
-exec cron -f
+log "=== INITIAL SYNC (no time limit) ==="
+flock -n /var/lock/nas-sync.lock /userapp/scripts/dispatch-sync.sh &
+wait_child $!
+[ -n "$GOT_TERM" ] && drain_and_exit
+log "Initial sync done (exit $WAIT_RC). Starting cron..."
+
+cron -f &
+CRON_PID=$!
+wait_child "$CRON_PID"
+[ -n "$GOT_TERM" ] && drain_and_exit
+log "ERROR: cron exited unexpectedly (rc=$WAIT_RC) — exiting so the pod restarts"
+exit 1
 ```
 
 > **Deployment mode and `incremental`.** If you set `SYNC_MODE=incremental` here, you must
@@ -1941,6 +1978,10 @@ exec cron -f
 > it every run degrades to a full sync. The `wait_for_remote` retry in the mode scripts
 > matters less here (the pod is long-lived and the sidecar is up by the time cron fires) but
 > is still used on the initial sync, which starts immediately at pod boot.
+>
+> **Shutdown (v3.16).** The entrypoint no longer `exec`s cron: it stays alive to stop cron and
+> signal every in-flight run when the pod is deleted, then waits up to `SHUTDOWN_WAIT` (50s)
+> for them — keep that below `terminationGracePeriodSeconds` (§10B.1). See §8.11.
 
 ### 8.8 File: `cluster-a/scripts/Dockerfile` (CRLF-safe, all scripts)
 
@@ -2034,6 +2075,8 @@ ENV VERIFY_FAIL_THRESHOLD=0
 
 # Default ENTRYPOINT = CronJob wrapper.
 # Deployment overrides command to use entrypoint-deployment.sh.
+# -g (signal the whole process group) is belt and braces since v3.16: the wrapper and the
+# Deployment entrypoint signal the sync themselves and wait for it (§8.11).
 ENTRYPOINT ["tini", "-g", "--", "/userapp/scripts/run-with-sidecar-quit.sh"]
 ```
 
@@ -2899,10 +2942,13 @@ spec:
         # istio-proxy exactly like a Job does. See §9A.2 for the full rationale.
         proxy.istio.io/config: '{"holdApplicationUntilProxyStarts": true}'
     spec:
+      # v3.16: covers SHUTDOWN_WAIT (50s, §8.7) plus margin, so in-flight rsyncs stop cleanly.
+      terminationGracePeriodSeconds: 60
       containers:
         - name: nas-sync-client
           image: your-registry.example.com/nas-sync-client:3.16   # ◄ MODIFY
-          # Override ENTRYPOINT: use deployment entry (initial sync + cron loop)
+          # Override ENTRYPOINT: use deployment entry (initial sync + cron loop).
+          # Keep tini as PID 1; the entrypoint itself handles SIGTERM (§8.7).
           command: ["tini", "-g", "--", "/userapp/scripts/entrypoint-deployment.sh"]
           imagePullPolicy: Always
           env:

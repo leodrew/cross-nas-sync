@@ -170,6 +170,22 @@ chmod +x "$T/shim/rsync"
 shim_set() { printf 'bw=%s\nmatch=%s\n' "$1" "${2:-}" > /etc/ngb-rsync-shim.conf; }
 shim_off() { rm -f /etc/ngb-rsync-shim.conf; }
 
+# date shim (deploy case, "SIGTERM right at start"). log() runs `date`, so holding ONE call parks the
+# entrypoint at a known point. It holds the first call after "OK Cron configured" has reached the log
+# (the test redirects 2>&1 into the log file, so this shell's fd 2 is that file; read it as /proc/$$/fd/2,
+# because grep's own stderr is /dev/null): the one inside log "=== INITIAL SYNC …", where the TERM trap
+# is installed and nothing is forked yet. NGB_HELD is a per-run marker, so only one call is held; the
+# sleep ends early when the TERM (tini -g: the whole group) arrives.
+mkdir -p "$T/shim-date"
+cat > "$T/shim-date/date" <<EOF
+#!/bin/bash
+if grep -q 'OK Cron configured' /proc/\$\$/fd/2 2>/dev/null && [ ! -e "\$NGB_HELD" ]; then
+    : > "\$NGB_HELD"; sleep 5
+fi
+exec $(command -v date) "\$@"
+EOF
+chmod +x "$T/shim-date/date"
+
 fresh_src() { rm -rf "$T/src"; mkdir -p "$T/src"; }
 fresh_dst() {  # fresh_dst <name> → echoes a NEW tmpfs mountpoint (the scripts require a mountpoint)
     local d="$T/dst-$1"
@@ -503,6 +519,46 @@ if [ "$SLOW" -eq 1 ] && want deploy; then
           mkdir -p "$T/src/big"; head -c 40000000 /dev/urandom > "$T/src/big/blob.bin" ) &
         SYNC_MODE=standard LOCAL_NAS_PATH="$DST" CRON_SCHEDULE='* * * * *' \
             sigterm_run "Deployment, cron-launched run" "$DST" "$T/dep-cron.log" "-g" -- "$S/entrypoint-deployment.sh"
+        # (c) SIGTERM right at the start, before the initial sync has been forked. A TERM that lands
+        # after the trap is installed and before the fork finds nothing to signal; an entrypoint that
+        # then starts the (unbounded) sync anyway never stops it, and the pod's SIGKILL leaves a temp
+        # file behind. That window is ~2 ms wide: the trap goes in ~25-35 ms after the container starts
+        # (measured on a fast machine) and the sync is forked 1-2 ms later, so a bare "TERM at ~50 ms"
+        # usually arrives after the fork and never reaches it. The date shim above therefore holds the
+        # entrypoint inside the window; the TERM then comes at 0.3 s, which leaves room for a slow machine.
+        # The slow rsync shim makes a sync that does start outlast the 15 s limit. A run counts as
+        # clean only if the container stopped within 15 s, exited 143 and left no temp file, AND it
+        # really reached the window: the shim held a call and the trap handled the TERM (otherwise
+        # the run proves nothing: a changed log line, or a machine slower than 0.3 s).
+        fresh_src; mkdir -p "$T/src/big"; head -c 40000000 /dev/urandom > "$T/src/big/blob.bin"
+        shim_set 1000                                                         # ~1 MB/s: an unsignalled sync runs ~40 s
+        EARLY_N=10; EARLY_OK=0; EARLY_BAD=""
+        for i in $(seq 1 "$EARLY_N"); do
+            DST=$(fresh_dst "dep-early-$i"); elog="$T/dep-early-$i.log"
+            NGB_HELD="$T/dep-early-$i.held" PATH="$T/shim-date:$PATH" SYNC_MODE=standard LOCAL_NAS_PATH="$DST" CRON_SCHEDULE='* * * * *' \
+                unshare --pid --fork --mount-proc tini -g -- "$S/entrypoint-deployment.sh" > "$elog" 2>&1 &
+            u=$!
+            sleep 0.3
+            tpid=$(pgrep -P "$u" -x tini | head -n 1)
+            if [ -z "$tpid" ]; then
+                EARLY_BAD="$EARLY_BAD $i(no tini)"; kill -KILL "$u" 2>/dev/null; wait "$u" 2>/dev/null; continue
+            fi
+            t0=$(date +%s); kill -TERM "$tpid"
+            for _ in $(seq 1 200); do kill -0 "$u" 2>/dev/null || break; sleep 0.1; done
+            took=$(( $(date +%s) - t0 ))
+            kill -0 "$u" 2>/dev/null && kill -KILL "$tpid" "$u" 2>/dev/null
+            wait "$u" 2>/dev/null; erc=$?
+            orph=$(find "$DST" -name '.blob*' -type f ! -path '*/.rsync-partial/*' | wc -l)
+            held=no;   [ -e "$T/dep-early-$i.held" ] && held=yes                       # the shim parked the entrypoint
+            ontrap=no; grep -qF 'stopping cron, signalling' "$elog" && ontrap=yes      # and the trap handled the TERM
+            if [ "$took" -le 15 ] && [ "$erc" -eq 143 ] && [ "$orph" -eq 0 ] && [ "$held" = yes ] && [ "$ontrap" = yes ]; then
+                EARLY_OK=$((EARLY_OK+1))
+            else
+                EARLY_BAD="$EARLY_BAD $i(took=${took}s rc=$erc orphans=$orph held=$held ontrap=$ontrap)"
+            fi
+        done
+        check "Deployment, SIGTERM right at start: $EARLY_OK/$EARLY_N runs stopped cleanly within 15 s${EARLY_BAD:+ — failed:$EARLY_BAD}" \
+            '[ "$EARLY_OK" -eq "$EARLY_N" ]'
         # The cron daemon lived inside the PID namespace and died with its PID 1.
         shim_off
         grep -qs "$SHIM_MARK" /usr/local/bin/rsync && rm -f /usr/local/bin/rsync

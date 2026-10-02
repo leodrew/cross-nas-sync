@@ -1905,6 +1905,10 @@ log() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"; }
 CRON_SCHEDULE="${CRON_SCHEDULE:-0 */2 * * *}"
 # Keep below terminationGracePeriodSeconds (§10B.1): time allowed for in-flight runs to stop.
 SHUTDOWN_WAIT="${SHUTDOWN_WAIT:-50}"
+# Seconds, a positive integer without a leading zero (bash reads 08 as octal). Anything else
+# would break the drain deadline in drain_and_exit.
+[[ "$SHUTDOWN_WAIT" =~ ^[1-9][0-9]*$ ]] \
+    || { log "WARN: SHUTDOWN_WAIT='${SHUTDOWN_WAIT}' is not a positive integer — using 50"; SHUTDOWN_WAIT=50; }
 
 log "=== NAS Sync Client v3.16 (Deployment, SYNC_MODE=${SYNC_MODE:-standard}) ==="
 log "Cron: ${CRON_SCHEDULE}"
@@ -1940,33 +1944,55 @@ log "OK Cron configured (/etc/cron.d/nas-sync, flock-guarded)"
 # they were SIGKILLed mid-transfer whenever the pod was deleted or rolled.
 GOT_TERM=""
 CRON_PID=""
+TERM_AT=""
 # Process groups of all running syncs: the initial sync (ours) and each cron job's.
 run_pgids() { ps -eo pgid=,args= | awk '/\/userapp\/scripts\/dispatch-sync\.sh/ {print $1}' | sort -u; }
-on_term() {
-    [ -n "$GOT_TERM" ] && return     # signalling our own group re-enters this trap
-    GOT_TERM=1
-    log "SIGTERM — stopping cron, signalling in-flight sync runs"
-    [ -n "$CRON_PID" ] && kill -TERM "$CRON_PID" 2>/dev/null
+# TERM to every sync run that exists right now. Repeating it is harmless, so drain_and_exit
+# calls it again on every poll: a run that started after on_term's scan (a cron tick at that
+# very instant) is still told to stop.
+signal_runs() {
     local pg
     for pg in $(run_pgids); do kill -TERM -- "-$pg" 2>/dev/null; done
 }
+on_term() {
+    [ -n "$GOT_TERM" ] && return     # signalling our own group re-enters this trap
+    GOT_TERM=1
+    TERM_AT=$SECONDS
+    log "SIGTERM — stopping cron, signalling in-flight sync runs"
+    [ -n "$CRON_PID" ] && kill -TERM "$CRON_PID" 2>/dev/null
+    signal_runs
+}
 trap on_term TERM INT
 drain_and_exit() {
-    local i=0
-    while [ "$i" -lt "$SHUTDOWN_WAIT" ] && [ -n "$(run_pgids)" ]; do sleep 1; i=$((i+1)); done
+    # SHUTDOWN_WAIT counts from the TERM, like kubelet's grace period. $SECONDS is whole seconds.
+    local end=$(( ${TERM_AT:-$SECONDS} + SHUTDOWN_WAIT ))
+    while [ "$SECONDS" -lt "$end" ] && [ -n "$(run_pgids)" ]; do
+        sleep 1
+        signal_runs
+    done
     [ -n "$(run_pgids)" ] && log "WARN: a sync is still running after ${SHUTDOWN_WAIT}s — it will be SIGKILLed"
     log "=== Shutdown complete ==="
     exit 143
 }
 
+# A TERM signals only what exists at that moment. So each launch below has a GOT_TERM check
+# before it (nothing to signal yet: do not start) and one right after it (the TERM landed
+# between the check and the fork: signal the new process now).
 log "=== INITIAL SYNC (no time limit) ==="
+[ -n "$GOT_TERM" ] && drain_and_exit      # the initial sync is unbounded: never start it after a TERM
 flock -n /var/lock/nas-sync.lock /userapp/scripts/dispatch-sync.sh &
-wait_child $!
+INIT_PID=$!
+# The sync is a background job of this shell, so it is in OUR process group: `kill -TERM 0`
+# reaches it even if flock has not exec'd yet and `ps` cannot see it (the §8.6 wrapper does the same).
+[ -n "$GOT_TERM" ] && kill -TERM 0 2>/dev/null
+wait_child "$INIT_PID"
 [ -n "$GOT_TERM" ] && drain_and_exit
 log "Initial sync done (exit $WAIT_RC). Starting cron..."
 
+[ -n "$GOT_TERM" ] && drain_and_exit      # do not start cron after a TERM
 cron -f &
 CRON_PID=$!
+[ -n "$GOT_TERM" ] && kill -TERM "$CRON_PID" 2>/dev/null    # on_term had no CRON_PID to stop
 wait_child "$CRON_PID"
 [ -n "$GOT_TERM" ] && drain_and_exit
 log "ERROR: cron exited unexpectedly (rc=$WAIT_RC) — exiting so the pod restarts"

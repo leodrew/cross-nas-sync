@@ -27,6 +27,17 @@
 > - **Weekly reconcile as a real manifest** (§9A.4) — it is the required compensating control
 >   for everything mtime-based detection cannot see (§12.1), not an optional extra.
 >
+> **v3.16 fixes the 2026-10 review findings** — each reproduced against v3.15's own scripts
+> first; evidence in `docs/superpowers/specs/2026-10-01-v316-review-fixes-design.md`:
+> - **Chunk generations** (§4.6, §8.3) — a reconcile can no longer receive a silent mix of two
+>   chunk generations, which left ~22% of the tree unreconciled.
+> - **One generator at a time** (§4.7) — a manual `kubectl create job --from=…` can no longer
+>   tear the manifest or publish a half-written chunk set.
+> - **Folder names with any character** (§8.11, §8.3, §8.10) — spaces, CJK, quotes and glob
+>   characters no longer break the reconcile fallback or blind the verify job.
+> - **Graceful shutdown** (§8.2–§8.7, §8.10, §8.11) — SIGTERM lets rsync save its partial file and is
+>   recorded in the status file; v3.15 was SIGKILLed mid-file on every pod deletion.
+>
 > **One image, selectable behavior** via `SYNC_MODE` env var:
 > - `standard` — single rsync (original)
 > - `parallel` — N concurrent workers over server chunks, falling back to top-level split
@@ -3136,6 +3147,39 @@ kubectl logs -n ea-pmc -l job-name=test-fallback | grep -E 'falling back to top-
 #    then run the client: expect "Manifest is STALE" and a Failed job.
 ```
 
+### v3.16 checks
+
+```bash
+# 1. Generator lock: a manual run while another run of the same generator is walking exits 75
+#    and changes nothing.
+kubectl --context cluster-b create job --from=cronjob/nas-sync-manifest lock-test -n ea-pmc
+sleep 15
+kubectl --context cluster-b logs -n ea-pmc -l job-name=lock-test --tail=-1 | grep -E "Lock 'manifests' acquired|held by|cannot determine the age"
+#    Expected: "acquired" if nothing else was running. That is then a real run: let it finish
+#    before the delete below, because a killed run keeps its lock until LOCK_STALE (600s).
+#    Otherwise "held by [...]" (or "cannot determine the age" on an unhealthy NAS, §13): the pod
+#    exits 75, and the Job retries it (backoffLimit) before it shows Failed.
+kubectl --context cluster-b delete job lock-test -n ea-pmc
+
+# 2. Chunk generation recorded.
+kubectl --context cluster-b exec deployment/nas-sync-server -n ea-pmc -c nas-sync-server -- \
+  cat /mnt/nas-source/.nas-sync-state/common/chunks/chunks.meta
+#    Expected: generated_at=… generation=g… chunk_count=24 total_files=…
+
+# 3. Graceful shutdown: delete a running sync pod, then read the status file.
+kubectl create job --from=cronjob/nas-sync-reconcile term-test -n ea-pmc
+sleep 120
+kubectl delete pod -n ea-pmc -l job-name=term-test --wait=true
+kubectl delete job term-test -n ea-pmc          # stop the replacement pod the Job would start
+kubectl exec <any-pod> -n ea-pmc -c nas-sync-client -- \
+  cat /mnt/nas-target/.nas-sync-status/last-run
+#    Expected: … exit=143 … interrupted=TERM
+
+# 4. Behavior suite (runs on a workstation with docker, not the cluster): every v3.16 fix
+#    exercised against a real rsync daemon, tini as PID 1, and cron.
+bash scripts/test-guide-behavior.sh --slow
+```
+
 ### Deployment
 
 ```bash
@@ -3360,7 +3404,10 @@ Messages and causes:
 |---|---|---|
 | `No chunk lists available (rc=…)` | Chunk CronJob never ran, or `.nas-sync-state/common/chunks/` unreadable | Run §6.3 job; confirm the source mount is `readOnly: false` |
 | `Chunks are stale (age=… > …)` | Chunk job failed the last N weeks | Check `kubectl --context cluster-b get jobs -l role=chunks` |
-| `chunks.meta present but no chunk-*.txt` | Chunk job was interrupted mid-publish | Re-run it; the atomic swap means the next run self-heals |
+| `chunks.meta present but no chunk files` | A v3.15-format set (no generation in `chunks.meta`) lost its chunk files — the chunk job was interrupted mid-publish; a v3.16 set in that state reports `Chunk set inconsistent` | Re-run the chunk job; the next run self-heals |
+| `Chunk files vanished mid-fetch (rc=24)` | The fetch overlapped the chunk job's swap (v3.16) | Nothing — the client retries once after `CHUNK_RETRY_WAIT` (30s) and uses the new generation; if the retry fails too, the run falls back to the top-level split |
+| `Chunk set inconsistent (generation …)` | Same, caught by the generation check | Nothing if the retry succeeds (otherwise the run falls back); if it repeats weekly, the chunk job runs into the reconcile — schedule it earlier |
+| `WARN: chunks.meta has no generation` | The chunk set was written by a v3.15 server — after a rollback, or until the first v3.16 chunk run after the upgrade | Warning only: the run still uses the chunks, as v3.15 did. Run the chunk job once on a v3.16 server image (§4.5) |
 
 None of these break the reconcile — it uses the v3.14 top-level split and completes. They
 only cost you the balanced-worker speedup.
@@ -3381,6 +3428,46 @@ Common causes: source NFS mount became read-only, the registry ConfigMap is malf
 (`ERROR: no valid clients in registry`), or the walk now exceeds `activeDeadlineSeconds`.
 Fix the generator, then the next client run proceeds normally. `MANIFEST_MAX_AGE` (default
 86400s) tunes the tolerance.
+
+### Generator Job Failed: `lock '…' held by […]` or `cannot determine the age of lock '…'` (exit 75)
+
+Another run of the same generator was already walking (v3.16, §4.7) — usually a manual
+`kubectl create job --from=cronjob/…` overlapped the scheduled run, or the reverse — or the
+lock's age could not be read. Either way the run that hit the lock **changed nothing** and
+exited 75. A Job retries a failed pod (`backoffLimit`: the Kubernetes default of 6 on the
+manifest job, 1 on the chunk job), so it shows Failed only if the lock still blocked the last
+retry.
+
+```bash
+# The ea-pmc namespace on Cluster B holds only these two generators' Jobs; they carry no role label.
+kubectl --context cluster-b get jobs -n ea-pmc --sort-by=.metadata.creationTimestamp | tail -5
+kubectl --context cluster-b exec deployment/nas-sync-server -n ea-pmc -c nas-sync-server -- \
+  sh -c 'ls -la /mnt/nas-source/.nas-sync-state/locks/; cat /mnt/nas-source/.nas-sync-state/locks/*/owner'
+```
+
+- **`held by […]`** — wait for the holder to finish (`host=` in its `owner` file is the pod
+  name), then re-run if you still need the run. In runbook S4, a run that started before you
+  edited the registry does not include the new client.
+- **`cannot determine the age of lock`** — a lock exists, but the script could not measure its
+  age (it reads the NAS clock by touching a probe file, then stats the lock's `heartbeat`), so
+  it fails closed and treats the lock as held rather than risk breaking a live run. Suspect the
+  source NAS — full, over quota, read-only or a stale mount (`df -h /mnt/nas-source` in the
+  server pod) — not a second run. Fix that, then re-run. If the NAS is unwritable before any
+  lock exists, the run exits **1** with a `cannot create …` error instead.
+- A lock whose `heartbeat` is older than `LOCK_STALE` (600s) belongs to a dead run and the next
+  run breaks it (`WARN: lock … is stale`). Never delete a lock by hand while its heartbeat is
+  fresh — a run is still writing.
+
+### Status shows `interrupted=TERM`
+
+The pod was stopped mid-sync: `activeDeadlineSeconds`, a node drain, a Deployment rollout (for
+example after editing `SYNC_MODE`), or `kubectl delete`. Since v3.16 rsync stops cleanly: the
+partial file is in `.rsync-partial/` and the next run resumes it. If it recurs on the same
+CronJob, the run no longer fits its `activeDeadlineSeconds` — raise it (§9A.2, §9A.4) or speed
+the sync up (runbook S13). A `WARN: a sync is still running after 50s` line in a Deployment's
+log (the number is `SHUTDOWN_WAIT`) means a run was still stopping when the wait ran out and
+kubelet then SIGKILLed it; raise `SHUTDOWN_WAIT` together with `terminationGracePeriodSeconds`,
+keeping it the smaller of the two.
 
 ---
 
@@ -3437,12 +3524,12 @@ cluster-a/
 ### Deploy Order
 
 ```
-1. Build & push server image v3.15            (Step 1: write §4.2/§4.3/§4.6, then §4.5)
+1. Build & push server image v3.16            (Step 1: write §4.2/§4.3/§4.6/§4.7, then §4.5)
 2. Deploy Cluster B server + patch GW         (Step 2)
 3. (incremental only) Deploy registry + manifest CronJob (Step 3 / §6.2)
 3b.(chunked reconcile) Deploy chunk CronJob   (§6.3)
 4. Verify Cluster B                           (Step 4)
-5. Build & push client image v3.15            (Step 5: write §8.2–§8.7 + §8.10, then §8.9)
+5. Build & push client image v3.16            (Step 5: write §8.2–§8.7 + §8.10 + §8.11, then §8.9)
 6. Deploy Cluster A shared resources          (9A.1)
 7. Choose k8s type:
    • CronJob    → cluster-a/cronjob-client.yaml    (Step 6A)
@@ -3462,7 +3549,7 @@ cluster-a/
 
 ## What This Consolidates
 
-| Capability | Source Version | Status in v3.15 |
+| Capability | Source Version | Status in v3.16 |
 |-----------|----------------|-----------------|
 | Port 8787 | v3.4 | ✓ |
 | No-delete (keep target-only files) | v3.5 | ✓ |
@@ -3502,9 +3589,21 @@ cluster-a/
 | `flock` overlap guard in Deployment cron | v3.15 | ✓ (§8.7) |
 | Cron registered once (not twice) | v3.15 | ✓ (§8.7) |
 | Per-worker failure tally in parallel mode | v3.15 | ✓ (§8.3) |
+| **Defect fixes (v3.16)** | | |
+| Chunk generations — no silent mixed chunk set | v3.16 | ✓ (§4.6, §8.3) — a mixed set left ~22% unreconciled |
+| One generator at a time (NFS `mkdir` lock + heartbeat) | v3.16 | ✓ (§4.7, §4.3, §4.6) — overlapping runs tore manifests |
+| Per-run temp names, atomic `manifest.meta` | v3.16 | ✓ (§4.3, §4.6) |
+| Folder names with any character (`--files-from --from0`) | v3.16 | ✓ (§8.11, §8.3) — spaces, CJK, quotes, glob characters |
+| Verify tier 2 sees every folder and reports rsync errors | v3.16 | ✓ (§8.10) — was blind to the same names |
+| Sync machinery never replicated by the fallback | v3.16 | ✓ (§8.11) — `.nas-sync-state/` was copied to targets |
+| Top-level pass non-recursive | v3.16 | ✓ (§8.3) — `-a --dirs` was a full serial sync |
+| Fallback proves every unit ran | v3.16 | ✓ (§8.3) — an aborted xargs reported "all OK" |
+| Graceful SIGTERM on every path | v3.16 | ✓ (§8.2–§8.7, §8.10, §8.11, §9A.2, §9A.4, §9A.5, §10B.1) — rsync was SIGKILLed mid-file |
+| Interrupted runs recorded (`interrupted=TERM`) | v3.16 | ✓ (§8.5) |
 
 Full rationale, evidence and failure scenarios for every v3.15 row:
-`docs/reviews/2026-07-22-nas-sync-architecture-review.md`.
+`docs/reviews/2026-07-22-nas-sync-architecture-review.md`. For every v3.16 row:
+`docs/superpowers/specs/2026-10-01-v316-review-fixes-design.md`.
 
 ---
 
@@ -3548,3 +3647,30 @@ state at all — it is a rebuild plus three new manifests:
 
 > Nothing on the source NAS needs migrating: `.nas-sync-state/clients/<id>/` is unchanged and
 > `common/chunks/` is created on first use.
+
+### Also required when coming from v3.15 → v3.16
+
+No state migration. Everything below is a rebuild plus small manifest edits; rollback is a tag
+change in either direction.
+
+1. **Let in-flight generator runs finish.** A v3.15 generator takes no lock, so it could
+   overlap the first v3.16 run:
+   `kubectl --context cluster-b get jobs -n ea-pmc -o custom-columns=NAME:.metadata.name,ACTIVE:.status.active`
+   must show `<none>` in every ACTIVE cell. (The §6 Jobs carry no `role` label; that namespace
+   holds only the two generators' Jobs.)
+2. **Source side first.** Add §4.7 (`nas-sync-state-lock.sh`), update §4.3, §4.6 and the §4.4
+   Dockerfile, rebuild the server image as `:3.16` (§4.5), roll the server Deployment, and
+   re-apply §6.1 and §6.3. v3.15 clients keep working: they match the new chunk names, and a
+   fetch that overlaps a swap now fails and falls back instead of mixing.
+3. **Then each target.** Add §8.11 (`nas-sync-lib.sh`), update §8.2–§8.8 and §8.10, rebuild
+   the client image as `:3.16` (§8.9), and re-apply §9A.2, §9A.4 and §9A.5 (new image tag and
+   `terminationGracePeriodSeconds`), plus §10B.1 if you run the Deployment.
+4. **Confirm** with §11's v3.16 checks.
+
+> New on the source NAS: `.nas-sync-state/locks/` (ignored by v3.15, never replicated). Each
+> v3.16 generator removes the leftovers of crashed runs when it next runs: v3.15's `.chunks.tmp`,
+> `.chunks.old` and `sync-manifest.txt.tmp`, and v3.16's own per-run `.chunks.tmp.<run id>`,
+> `.chunks.old.<run id>`, `sync-manifest.txt.tmp.<run id>` and `manifest.meta.tmp.<run id>`
+> (the chunk leftovers go with the next weekly chunk run). v3.15 only cleans its unsuffixed
+> names, so after a rollback delete any per-run leftovers of a crashed v3.16 run by hand — the
+> chunk directories are large.

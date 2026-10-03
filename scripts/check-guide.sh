@@ -160,7 +160,8 @@ for GUIDE in "${GUIDES[@]}"; do
     MISSING=""
     while read -r b; do
         [ -n "$b" ] || continue
-        printf '%s' "$CHK" | grep -qF "$b" || MISSING="$MISSING $b"
+        # A shell pattern, not `printf | grep -q`: under pipefail that pipe fails now and then when grep exits early.
+        case "$CHK" in *"$b"*) ;; *) MISSING="$MISSING $b" ;; esac
     done < "$WORK/defined.txt"
     if [ -n "$MISSING" ]; then fail "defined but not in §14 checklist:$MISSING"; else pass "$(wc -l < "$WORK/defined.txt" | tr -d ' ') defined file(s) all listed in §14"; fi
 
@@ -210,57 +211,195 @@ for GUIDE in "${GUIDES[@]}"; do
     # ---------------------------------------------------------------
     head2 "10. v3.16 defect-fix regressions"
     # IDs are the findings in docs/superpowers/specs/2026-10-01-v316-review-fixes-design.md §2.
-    check_absent() { if grep -qF -e "$2" -- "$GUIDE"; then fail "$1 — must not appear: $2"; else pass "$1"; fi; }
-    # Text of one guide section: from its "### <sec> File" heading up to the next "### " heading.
-    sec_text() { awk -v s="### $1 File" 'index($0, s) == 1 {f = 1; next} f && /^### / {exit} f' "$GUIDE"; }
-    # No -q: with pipefail an early grep exit could SIGPIPE awk and fail a check that passed.
-    check_in_sec() { if sec_text "$2" | grep -F -e "$3" -- >/dev/null; then pass "$1"; else fail "$1 — expected to find: $3"; fi; }
+    #
+    # Every pin is matched against CODE: the guide's fenced blocks, one section at a time (or all of
+    # them), with indentation, comment lines and trailing comments removed. Prose, comments and the
+    # changelog quote these strings, so a pin they could satisfy would stay green with the code gone.
+    #   sec_text <sec>          one section's raw text, "### <sec> File" up to the next ## or ###
+    #                           heading (empty <sec>: the whole guide); a fence line hides headings
+    #   code_only [lang-regex]  filter: the fenced lines only (of those languages)
+    #   sec_code <sec> [langs]  the two combined; guide_code [langs] = the whole guide's code blocks
+    #   yaml_code [sec]         the same for ```yaml blocks only (the whole guide when <sec> is empty)
+    # Every matcher reads its whole input: with pipefail an early grep -q exit could SIGPIPE the
+    # producer and fail a check that passed. Several pin arguments = that many CONSECUTIVE code
+    # lines, each containing its argument (the comments between them do not count).
+    sec_text() {
+        awk -v s="${1:+### $1 File}" '
+            BEGIN { f = (s == "") }
+            { fl = ($0 ~ /^```[a-zA-Z]*$/) }
+            !fence && !fl && f && s != "" && /^###? / { exit }
+            !fence && !fl && !f && index($0, s) == 1 { f = 1; next }
+            f { print }
+            fl { fence = !fence }' "$GUIDE"
+    }
+    code_only() {
+        awk -v L="${1:-}" '
+            /^```[a-zA-Z]*$/ { fence = !fence; if (fence) keep = (L == "" || substr($0, 4) ~ L); next }
+            fence && keep {
+                sub(/^[ \t]+/, "")
+                if ($0 == "" || $0 ~ /^#/) next
+                sub(/[ \t]+#.*$/, "")
+                print
+            }'
+    }
+    sec_code()   { sec_text "$1" | code_only "${2:-}"; }
+    guide_code() { sec_text "" | code_only "${1:-}"; }
+    yaml_code()  { sec_code "${1:-}" '^ya?ml$'; }
+    has_pin() {  # stdin: code lines; arguments: the pin's lines
+        local IFS=$'\n'
+        PIN="$*" awk '
+            BEGIN { n = split(ENVIRON["PIN"], P, "\n") }
+            {
+                for (k = 1; k < n; k++) W[k] = W[k + 1]
+                W[n] = $0
+                if (++c >= n) { m = 1; for (k = 1; k <= n; k++) if (index(W[k], P[k]) == 0) m = 0; if (m) hit = 1 }
+            }
+            END { exit !hit }'
+    }
+    fn_body() { FN="$1" awk 'BEGIN { s = ENVIRON["FN"] "() {" } index($0, s) == 1 { f = 1; next } f && $0 == "}" { f = 0; next } f'; }
+    pins() { local o="$1" p; shift; for p in "$@"; do o="$o ⏎ $p"; done; printf '%s' "$o"; }
+    check_in_sec() {  # label sec pin...: the section's code has this line (these consecutive lines)
+        local label="$1" sec="$2"; shift 2
+        if sec_code "$sec" | has_pin "$@"; then pass "$label"; else fail "$label — expected to find: $(pins "$@") (in §$sec code)"; fi
+    }
+    check_in_fn() {   # label sec function pin...: ... inside that shell function
+        local label="$1" sec="$2" fn="$3"; shift 3
+        if sec_code "$sec" | fn_body "$fn" | has_pin "$@"; then pass "$label"; else fail "$label — expected to find: $(pins "$@") (in §$sec $fn)"; fi
+    }
+    check_absent() {  # label pin [sec]: in no code line (of the section, else of the guide)
+        local src
+        if [ -n "${3:-}" ]; then src=$(sec_code "$3"); else src=$(guide_code); fi
+        if printf '%s\n' "$src" | has_pin "$2"; then fail "$1 — must not appear: $2"; else pass "$1"; fi
+    }
+    check_order() {   # label sec first second: the first code line holding $first precedes the first holding $second
+        if sec_code "$2" | A="$3" B="$4" awk '
+            !a && index($0, ENVIRON["A"]) { a = NR }
+            !b && index($0, ENVIRON["B"]) { b = NR }
+            END { exit !(a && b && a < b) }'; then pass "$1"; else fail "$1 — expected in §$2 code: $3 ... before ... $4"; fi
+    }
+    count_code() {    # sec pin: code lines of the section that START with the pin
+        sec_code "$1" | P="$2" awk 'index($0, ENVIRON["P"]) == 1 { n++ } END { print n + 0 }'
+    }
     case "$GUIDE" in
       *v3.1[6-9]*|*v3.[2-9]*)
-        check_has    "F1: chunk files carry their generation"           "generation="
-        check_has    "F1: client retries an inconsistent chunk set"     "CHUNK_RETRY_WAIT"
-        check_has    "F2: manifest generator takes the state-dir lock"  "lock_acquire manifests"
-        check_has    "F2: chunk generator takes the state-dir lock"     "lock_acquire chunks"
-        check_has    "F2: lock library is COPYed into the server image" "COPY nas-sync-state-lock.sh"
-        check_has    "F3/F4: folder names travel via --files-from"      "--from0 --files-from=-"
-        check_has    "F3/F4: one shared top-level lister"               "list_top_dirs"
-        check_has    "F3/F4: library is COPYed into the client image"   "COPY nas-sync-lib.sh"
-        check_has    "F4: the lister's perl is checked at build time"   "command -v perl"
-        check_absent "F4: v3.15 \$NF folder parser is gone"             '$NF != "."'
-        check_has    "F5: top-level pass is non-recursive"              "--no-recursive --dirs"
-        # Every rsync command line with --dirs must be non-recursive: -a implies -r.
-        if grep -E 'rsync .*--dirs' "$GUIDE" | grep -vqF -e '--no-recursive --dirs'; then
+        # ---- F1: chunk generations
+        check_in_sec "F1: chunk files carry their generation"           4.6 '- "${TMP_DIR}/chunk-${GEN}-"'
+        check_in_sec "F1: chunks.meta records the generation"           4.6 'generation=%s'
+        check_in_sec "F1: client retries an inconsistent chunk set"     8.3 'sleep "$CHUNK_RETRY_WAIT"'
+        # ---- F2: generator lock
+        check_in_sec "F2: manifest generator takes the state-dir lock"  4.3 'lock_acquire manifests'
+        check_in_sec "F2: chunk generator takes the state-dir lock"     4.6 'lock_acquire chunks'
+        check_in_sec "F2: lock library is COPYed into the server image" 4.4 'COPY nas-sync-state-lock.sh'
+        check_in_sec "F2: a held lock exits 75, the second run does nothing"  4.7 'held by [' 'exit "$LOCK_EXIT_HELD"'
+        check_in_sec "F2: an unreadable lock age exits 75 (fails closed)" 4.7 'cannot determine the age of lock' 'exit "$LOCK_EXIT_HELD"'
+        check_in_sec "F2: the held/unknown exit code is 75"             4.7 'LOCK_EXIT_HELD=75'
+        check_in_sec "F2: LOCK_HEARTBEAT read as decimal (08 is an octal error: no lock)" 4.7 'LOCK_HEARTBEAT=$((10#$LOCK_HEARTBEAT))'
+        check_in_sec "F2: LOCK_STALE read as decimal (08 is an octal error: no lock)"     4.7 'LOCK_STALE=$((10#$LOCK_STALE))'
+        check_in_sec "F2: _lock_sweep defined (displaced lock dirs pile up)"  4.7 '_lock_sweep() {'
+        check_in_sec "F2: lock_acquire calls _lock_sweep"               4.7 '_lock_sweep "$name"'
+        # ---- F3/F4: folder names
+        check_in_sec "F3/F4: parallel passes folder names via --files-from" 8.3  '-r --from0 --files-from=-'
+        check_in_sec "F3/F4: verify passes folder names via --files-from"   8.10 '-r --from0 --files-from=-'
+        check_in_sec "F3/F4: the shared top-level lister is defined"        8.11 'list_top_dirs() {'
+        check_in_sec "F3/F4: parallel lists top-level dirs with it"         8.3  'list_top_dirs > '
+        check_in_sec "F3/F4: verify lists top-level dirs with it"           8.10 'list_top_dirs > '
+        check_in_sec "F3/F4: library is COPYed into the client image"       8.8  'COPY nas-sync-lib.sh'
+        check_in_sec "F4: the lister's perl is checked at build time"       8.8  '&& command -v perl'
+        check_absent "F4: v3.15 \$NF folder parser is gone"                 '$NF != "."'
+        # The listing must not miss a folder: rc 0 and 24 only. rc 23 (an entry that exists was unreadable) would drop it.
+        check_in_sec "F3/F4: parallel's top-level listing accepts rc 0/24 only" 8.3  'case "$LIST_RC" in' '0|24) ;;' 'die "Cannot list top-level folders'
+        check_in_sec "F3/F4: verify's top-level listing accepts rc 0/24 only"   8.10 'case "$LIST_RC" in' '0|24) ;;' 'die "Tier 2: cannot list top-level dirs'
+        # ---- F5: non-recursive top-level pass
+        check_in_sec "F5: top-level pass is non-recursive"              8.3 'rsync $RSYNC_FLAGS --no-recursive --dirs'
+        # Every rsync command line with --dirs must be non-recursive: -a implies -r. Code only, \ continuations joined.
+        BADDIRS=$(guide_code | awk '
+            function chk(s) { if (s ~ /rsync .*--dirs/ && s !~ /--no-recursive --dirs/) n++ }
+            { cur = cur $0 }
+            cur ~ /\\$/ { sub(/\\$/, " ", cur); next }
+            { chk(cur); cur = "" }
+            END { if (cur != "") chk(cur); print n + 0 }')
+        if [ "$BADDIRS" -gt 0 ]; then
             fail "F5: a recursive '-a --dirs' rsync is back (copies the whole tree serially)"
         else
             pass "F5: no recursive '--dirs' rsync"
         fi
-        # §8.7 also contains this line, so the wrapper check is scoped to §8.6.
-        check_in_sec "F6: wrapper signals its process group"            8.6 "kill -TERM 0 2>/dev/null"
-        check_has    "F6: dispatcher waits for the mode script"         'wait_child "$CHILD"'
-        check_has    "F6: entrypoint waits for cron and its runs"       'wait_child "$CRON_PID"'
-        # A command line, not prose: comments may explain why it is gone.
-        if grep -qE '^[[:space:]]*exec cron' "$GUIDE"; then
+        # ---- F6: graceful SIGTERM. §8.7 also has kill -TERM 0, so the wrapper's is pinned inside its on_term.
+        check_in_fn  "F6: wrapper signals its process group"            8.6 on_term 'kill -TERM 0 2>/dev/null'
+        check_in_sec "F6: wrapper traps TERM/INT (else tini SIGKILLs rsync)" 8.6 'trap on_term TERM INT'
+        check_order  "F6: wrapper's trap is set before the sync starts" 8.6 'trap on_term TERM INT' '/userapp/scripts/dispatch-sync.sh &'
+        check_in_sec "F6: wrapper passes on a TERM that landed before the fork" 8.6 '[ -n "$GOT_TERM" ] && kill -TERM $! 2>/dev/null'
+        check_in_sec "F6: wrapper keeps the sync exit code on a late TERM (not 143)" 8.6 "trap 'exit \"\$SYNC_EXIT\"' TERM INT"
+        check_in_sec "F6: wrapper still quits the sidecar without nas-sync-lib.sh (else the pod hangs NotReady)" 8.6 'wait_child() { wait "$1"; WAIT_RC=$?; }'
+        check_in_sec "F6: dispatcher waits for the mode script"         8.5 'wait_child "$CHILD"'
+        check_in_sec "F6: entrypoint waits for the initial sync"        8.7 'wait_child "$INIT_PID"'
+        check_in_sec "F6: entrypoint waits for cron and its runs"       8.7 'wait_child "$CRON_PID"'
+        # A command, not prose: comments explain why it is gone.
+        if guide_code | has_pin 'exec cron'; then
             fail "F6: the Deployment entrypoint execs cron again (cron-launched runs lose SIGTERM)"
         else
             pass "F6: entrypoint does not exec cron"
         fi
-        GRACE=$(grep -c 'terminationGracePeriodSeconds: 60' "$GUIDE")
-        if [ "$GRACE" -ge 4 ]; then pass "F6: grace period on all $GRACE client pod specs"; else fail "F6: terminationGracePeriodSeconds: 60 on $GRACE pod spec(s), expected 4 (§9A.2, §9A.4, §9A.5, §10B.1)"; fi
-        # §8.7 shutdown fixes (code lines, not comments) that only the slow runtime suite covers otherwise.
+        # One terminationGracePeriodSeconds: 60 per client pod spec, in the YAML of its own section.
+        GRACE=0; GRACE_MISSING=""
+        for s in 9A.2 9A.4 9A.5 10B.1; do
+            if [ "$(yaml_code "$s" | awk '$0 == "terminationGracePeriodSeconds: 60" { n++ } END { print n + 0 }')" -ge 1 ]; then
+                GRACE=$((GRACE+1))
+            else
+                GRACE_MISSING="$GRACE_MISSING §$s"
+            fi
+        done
+        if [ "$GRACE" -eq 4 ]; then pass "F6: grace period on all $GRACE client pod specs"; else fail "F6: terminationGracePeriodSeconds: 60 missing from the YAML of:$GRACE_MISSING (§9A.2, §9A.4, §9A.5, §10B.1 each need it)"; fi
+        # §8.7 shutdown fixes that only the slow runtime suite covers otherwise.
+        check_in_sec "F6: §8.7 traps TERM/INT (else tini SIGKILLs the runs)" 8.7 'trap on_term TERM INT'
+        check_order  "F6: §8.7 trap is set before the initial sync starts" 8.7 'trap on_term TERM INT' 'dispatch-sync.sh &'
+        check_in_fn  "F6: §8.7 on_term signals the in-flight runs"      8.7 on_term 'signal_runs'
+        check_in_fn  "F6: §8.7 on_term stops cron"                      8.7 on_term '[ -n "$CRON_PID" ] && kill -TERM "$CRON_PID"'
         check_in_sec "F6: §8.7 a TERM at launch still signals the initial sync" 8.7 '[ -n "$GOT_TERM" ] && kill -TERM 0 2>/dev/null'
-        check_in_sec "F6: §8.7 a TERM at launch still stops cron"        8.7 '[ -n "$GOT_TERM" ] && kill -TERM "$CRON_PID"'
+        check_in_sec "F6: §8.7 a TERM at launch still stops cron"       8.7 '[ -n "$GOT_TERM" ] && kill -TERM "$CRON_PID"'
         check_in_sec "F6: §8.7 drain signals each run group once (a repeat TERM loses the partial)" 8.7 'case "$SIGNALLED" in'
-        # A launch guarded by a drain on the previous code line (comments and blanks skipped): a TERM before
+        check_in_sec "F6: §8.7 records signalled run groups (else TERMed on every poll)" 8.7 'SIGNALLED="$SIGNALLED$pg "'
+        check_in_sec "F6: §8.7 signals the run's process group"         8.7 'kill -TERM -- "-$pg" 2>/dev/null'
+        DRAINS=$(count_code 8.7 '[ -n "$GOT_TERM" ] && drain_and_exit')
+        if [ "$DRAINS" -ge 4 ]; then
+            pass "F6: §8.7 drains after a TERM at all $DRAINS waits and launches"
+        else
+            fail "F6: §8.7 has $DRAINS of 4 '[ -n \"\$GOT_TERM\" ] && drain_and_exit' lines (before and after the initial sync, before and after cron) — a TERM at the missing spot ends without waiting for the runs"
+        fi
+        # A launch guarded by a drain on the previous code line (comments and blanks are gone): a TERM before
         # the launch must not start an unbounded sync or cron. The post-wait drains do not count.
-        PRELAUNCH=$(sec_text 8.7 | awk '/^[[:space:]]*(#|$)/ {next}
-            /^[[:space:]]*(flock -n|cron -f)/ && prev ~ /^[[:space:]]*\[ -n "\$GOT_TERM" \] && drain_and_exit/ {n++}
-            {prev = $0} END {print n + 0}')
+        PRELAUNCH=$(sec_code 8.7 | awk '/^(flock -n|cron -f)/ && prev ~ /^\[ -n "\$GOT_TERM" \] && drain_and_exit/ { n++ } { prev = $0 } END { print n + 0 }')
         if [ "$PRELAUNCH" -ge 2 ]; then
             pass "F6: §8.7 no launch after a TERM (initial sync and cron guarded)"
         else
             fail "F6: §8.7 pre-launch drain_and_exit guards $PRELAUNCH of 2 launches (initial sync, cron) — a TERM before launch starts a sync nobody signals"
         fi
-        check_has    "F7: status records interruptions"                 "interrupted=TERM"
+        # ---- Dockerfiles: the CRLF guard must work under /bin/sh (dash), where $'\r' is not a carriage return.
+        for s in 4.4 8.8; do
+            check_in_sec "Dockerfile §$s: CRLF guard counts CR bytes with tr" $s "tr -cd '\\r'"
+            check_absent "Dockerfile §$s: no \$'\\r' in the CRLF guard (dash never fires it)" "\$'\\r'" $s
+        done
+        # ---- verify (§8.10): settings validated before any tier runs; rc 23 fails the run
+        check_in_sec "verify: VERIFY_MODE validated (else a typo ends in VERIFY OK)" 8.10 'case "$VERIFY_MODE" in meta|checksum|both) ;; *) die "VERIFY_MODE='
+        check_in_sec "verify: VERIFY_FAIL_THRESHOLD validated (else drift can end in VERIFY OK)" 8.10 "case \"\$VERIFY_FAIL_THRESHOLD\" in ''|*[!0-9]*) die \"VERIFY_FAIL_THRESHOLD="
+        check_in_sec "verify: VERIFY_FAIL_THRESHOLD read as decimal (08 = octal error)" 8.10 'VERIFY_FAIL_THRESHOLD=$((10#$VERIFY_FAIL_THRESHOLD))'
+        check_in_sec "verify: VERIFY_SLICES must be digits (tier 2 only)" 8.10 "case \"\$VERIFY_SLICES\" in ''|*[!0-9]*) die \"VERIFY_SLICES="
+        check_in_sec "verify: VERIFY_SLICES >= 1 (0 divides by zero)" 8.10 '[ "$VERIFY_SLICES" -ge 1 ] 2>/dev/null || die "VERIFY_SLICES='
+        check_in_sec "verify: VERIFY_SLICES read as decimal (08 = octal error)" 8.10 'VERIFY_SLICES=$((10#$VERIFY_SLICES))'
+        check_order  "verify: VERIFY_MODE is validated before tier 1 runs" 8.10 'case "$VERIFY_MODE" in meta|checksum|both)' 'rsync $BASE_FLAGS "${REMOTE_URL}/"'
+        check_order  "verify: VERIFY_FAIL_THRESHOLD is validated before tier 1 runs" 8.10 'VERIFY_FAIL_THRESHOLD=$((10#$VERIFY_FAIL_THRESHOLD))' 'rsync $BASE_FLAGS "${REMOTE_URL}/"'
+        check_order  "verify: VERIFY_SLICES validated before tier 1 runs" 8.10 '[ "$VERIFY_SLICES" -ge 1 ] 2>/dev/null' 'rsync $BASE_FLAGS "${REMOTE_URL}/"'
+        check_in_sec "verify: tier 1 fails on rc 23 (unreadable dir not compared)" 8.10 'if [ "$RC" -ne 0 ] && [ "$RC" -ne 24 ]; then'
+        check_in_sec "verify: tier-2 rc 23 tolerated only with the link_stat line" 8.10 "! grep -q 'link_stat"
+        check_in_sec "verify: any other tier-2 rc 23 fails the run with 23" 8.10 'die "verify aborted" 23'
+        # ---- MANIFEST_MAX_AGE / CHUNK_MAX_AGE: a non-number made the staleness test an error, i.e. false
+        for v in "8.4 MANIFEST_MAX_AGE" "8.3 CHUNK_MAX_AGE"; do
+            read -r s var <<< "$v"
+            check_in_sec "$var validated (a non-number turns the staleness guard off)" "$s" "if case \"\$$var\" in" "''|*[!0-9]*) false ;;"
+            check_in_sec "$var read as decimal (08 = octal error)" "$s" "$var=\$((10#\$$var))"
+            check_in_sec "$var falls back to 86400 with a WARN" "$s" "log \"WARN: $var=" "$var=86400"
+        done
+        # ---- F7: status file
+        check_in_sec "F7: status records interruptions"                 8.5 '${INTERRUPTED:+ interrupted=TERM}'
         ;;
       *) warn "pre-v3.16 guide — skipping v3.16 regression checks" ;;
     esac

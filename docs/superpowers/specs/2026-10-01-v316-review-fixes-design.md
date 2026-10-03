@@ -85,8 +85,9 @@ On rc 24 or a failed check:
 
 A stale set falls back immediately, as in v3.15.
 
-A `chunks.meta` with no `generation` line comes from a v3.15 server, which only happens after a rollback. In that
-case the client logs a WARN and accepts `chunk-*.txt`, which is v3.15 behavior.
+A `chunks.meta` with no `generation` line was written by a v3.15 chunk job. That is the case after a rollback to a
+v3.15 server, and also after a normal upgrade until the first v3.16 chunk run replaces the set (only that weekly job
+rewrites it). In that case the client logs a WARN and accepts `chunk-*.txt`, which is v3.15 behavior.
 
 Workers consume only `chunk-${GEN}-*.txt`.
 
@@ -310,7 +311,7 @@ depends on it, as the matrix below shows.
 | Combination | Result |
 |---|---|
 | v3.16 server + v3.15 clients (the normal mid-upgrade state) | Chunk names match `chunk-*.txt`. An overlapping fetch fails (rc 24) and falls back, which is safe. Manifests are unchanged. |
-| v3.15 server + v3.16 clients (only after a rollback) | `chunks.meta` without `generation` is accepted with a WARN (v3.15 behavior). Everything else is unchanged. |
+| v3.16 clients + a chunk set written by v3.15 (after a rollback, or between the upgrade and the first v3.16 chunk run) | `chunks.meta` without `generation` is accepted with a WARN (v3.15 behavior). Everything else is unchanged. |
 | Leftover v3.15 temp names on the NAS | Cleaned up by the v3.16 globs, under the lock. |
 | `locks/` left behind after rolling back to v3.15 | Ignored by v3.15. It sits under `.nas-sync-state/`, so it is never replicated. |
 

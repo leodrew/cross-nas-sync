@@ -13,14 +13,18 @@
 #              Windows/MSYS and never touches the host. Pass the guide repo-relative.
 #   --native   run on THIS Linux host: needs root, rsync, tini, perl, unshare, nc, flock,
 #              pgrep, comm, mount, mountpoint, timeout (+ cron, and cc for one sub-case, for --slow). It writes
-#              /userapp/scripts, /etc/cron.d/nas-sync and
-#              /etc/environment (restored afterwards) — use a disposable container or CI.
+#              /userapp/scripts, /etc/cron.d/nas-sync and /etc/environment, and puts back afterwards what
+#              it found (a pre-existing /etc/cron.d/nas-sync is backed up and restored) — still, use a
+#              disposable container or CI.
 #   --slow     add the `deploy` case (waits for two cron minute boundaries, ~2-3 min).
 #   --case X   run only case X (repeatable): names build loose swap stale lock signal deploy
 #              (deploy implies --slow). An unknown X exits 2; so does a requested case
 #              that was skipped, even in part (`--case deploy` without cc), or a run in which
 #              no check ran. Without --case, a skip is reported and the exit stays 0.
-#   NGB_KEEP=1 keep the workspace (logs of every run) and print its path
+#   NGB_KEEP=1 keep the workspace (logs of every run) and print its path. With --native it stays
+#              in /tmp. In docker mode the container (and its /tmp) is deleted on exit, so the
+#              workspace is copied to NGB_KEEP_DIR on the host (default ${TMPDIR:-/tmp}/ngb-keep)
+#              and that path is printed. The dst-* targets are tmpfs mounts: their data is not kept.
 #############################################
 set -uo pipefail
 
@@ -38,7 +42,7 @@ while [ "$#" -gt 0 ]; do
                   [ "$ok_case" -eq 1 ] || { echo "unknown case: '$1' (valid: $CASES)"; exit 2; }
                   [ "$1" = deploy ] && SLOW=1
                   ONLY+=("$1") ;;
-        -h|--help) sed -n '2,23p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,27p' "$0"; exit 0 ;;
         *)        GUIDE="$1" ;;
     esac
     shift
@@ -49,7 +53,17 @@ if [ "$NATIVE" -eq 0 ]; then
     command -v docker >/dev/null 2>&1 \
         || { echo "docker not found. Install it, or use --native inside a disposable Linux container (root)."; exit 2; }
     HOST_DIR=$(cd "$REPO_ROOT" && { pwd -W 2>/dev/null || pwd; })
-    MSYS_NO_PATHCONV=1 exec docker run --rm --privileged -e NGB_KEEP -v "${HOST_DIR}:/repo" -w /repo ubuntu:24.04 bash -c '
+    # NGB_KEEP: the workspace lives in the container's /tmp, which `--rm` deletes with the container. A host directory is
+    # mounted at /ngb-keep and cleanup() copies the workspace there (NGB_KEEP_DEST tells it where; NGB_KEEP_HOST is only
+    # the path it prints).
+    KEEP_ARGS=()
+    if [ "${NGB_KEEP:-0}" = 1 ]; then
+        KEEP_HOST="${NGB_KEEP_DIR:-${TMPDIR:-/tmp}/ngb-keep}"
+        mkdir -p "$KEEP_HOST" || { echo "cannot create NGB_KEEP_DIR '$KEEP_HOST'"; exit 2; }
+        KEEP_MOUNT=$(cd "$KEEP_HOST" && { pwd -W 2>/dev/null || pwd; })
+        KEEP_ARGS=(-v "${KEEP_MOUNT}:/ngb-keep" -e NGB_KEEP_DEST=/ngb-keep -e "NGB_KEEP_HOST=${KEEP_HOST}")
+    fi
+    MSYS_NO_PATHCONV=1 exec docker run --rm --privileged -e NGB_KEEP ${KEEP_ARGS[@]+"${KEEP_ARGS[@]}"} -v "${HOST_DIR}:/repo" -w /repo ubuntu:24.04 bash -c '
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq >/dev/null && apt-get install -y -qq rsync tini perl cron procps util-linux \
             netcat-openbsd gcc libc6-dev >/dev/null || { echo "apt-get failed"; exit 2; }
@@ -86,18 +100,93 @@ bg_stop() {     # bg_stop <pid>: stop a helper registered with bg_add, reap it, 
 }
 HAD_USERAPP=0; [ -d /userapp ] && HAD_USERAPP=1
 cp -a /etc/environment "$T/environment.bak" 2>/dev/null
+# The §8.7 entrypoint (deploy case) writes /etc/cron.d/nas-sync, and its cron line makes flock create /var/lock/nas-sync.lock.
+# Both are removed afterwards only if the suite is what created them: a cron file that was there before is backed up now
+# and put back by restore_cronfile; a lock file that was there before is left alone.
+HAD_CRONFILE=0; HAD_LOCKFILE=0
+if [ -e /etc/cron.d/nas-sync ] || [ -L /etc/cron.d/nas-sync ]; then
+    HAD_CRONFILE=1
+    cp -a /etc/cron.d/nas-sync "$T/cron-nas-sync.bak" \
+        || { echo "cannot back up the existing /etc/cron.d/nas-sync (it would be overwritten): refusing to run"; rm -rf "$T"; exit 2; }
+fi
+[ -e /var/lock/nas-sync.lock ] && HAD_LOCKFILE=1
+restore_cronfile() {   # the deploy case calls it when it ends, cleanup() calls it again: idempotent
+    rm -f /etc/cron.d/nas-sync
+    if [ "$HAD_CRONFILE" -eq 1 ]; then cp -a "$T/cron-nas-sync.bak" /etc/cron.d/nas-sync; fi
+}
+
+# ---- timeout, and what an abort leaves behind ----
+# Every run of a script under test goes through coreutils `timeout` WITHOUT --foreground. That is deliberate: timeout
+# then leads a NEW process group, so when the bound expires it kills the script's children too (rsync, xargs, find),
+# and the `kill -TERM 0` of the §8.6 wrapper reaches only that run, never this suite. The price: a Ctrl-C or a group
+# TERM aimed at the suite's own group misses the run, and bash defers a trap while a foreground command runs. Measured
+# on a script of this shape with a plain foreground `timeout`: a group INT was swallowed (the script carried on to its next
+# statement and exited 0), and a TERM to the script left the run going. So `timeout` below is a function: it starts the real
+# one in the background and waits, and the trap on INT/TERM/HUP then fires at once (exit 130/143/129, run through cleanup).
+# reap_runs (cleanup) signals what is still running.
+# <&0 keeps the stdin a foreground command would have had. A run started in the BACKGROUND uses `command timeout` instead
+# of the function: a function call in the background is a subshell, which a group INT kills, and the `timeout` under it
+# would be orphaned out of reach of reap_runs (found by ancestry). A `timeout` inside a script under test is not affected
+# (functions are not exported); where it matters it carries its own comment (§8.2-§8.6 mountpoint).
+timeout() { command timeout "$@" <&0 & wait "$!"; }
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+reap_runs() {   # stop what this shell started and has not waited for: found by ancestry below this shell, never by command line
+    local p name groups="" inits="" i alive
+    while read -r name p; do
+        case "$name" in
+            timeout) groups="$groups $p" ;;            # a group leader: TERM the group, SIGKILL it if it lingers
+            tini)    inits="$inits $p" ;;              # PID 1 of a container namespace (sigterm_run, deploy): SIGKILL
+        esac                                           #   makes the kernel kill the rest of the namespace, cron included
+    done < <(ps -e -o pid=,ppid=,comm= 2>/dev/null | awk -v root="$$" '
+        { pp[$1] = $2; cm[$1] = $3; order[++n] = $1 }
+        END { for (i = 1; i <= n; i++) { p = order[i]; a = pp[p]
+                while (a != "" && a > 1) { if (a == root) { print cm[p], p; break } a = pp[a] } } }')
+    # shellcheck disable=SC2086
+    [ -n "$inits" ] && kill -KILL $inits 2>/dev/null
+    [ -n "$groups" ] || return 0
+    for p in $groups; do kill -TERM -- "-$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null; done
+    for i in $(seq 1 20); do
+        alive=0; for p in $groups; do kill -0 "$p" 2>/dev/null && alive=1; done
+        [ "$alive" -eq 0 ] && break; sleep 0.25
+    done
+    for p in $groups; do kill -KILL -- "-$p" 2>/dev/null; done
+}
+
+stop_pid() {    # stop_pid <pid>: TERM, up to 2 s to go, then KILL, and reap it: nothing of ours is still exiting when the suite returns
+    local p="$1" i
+    kill "$p" 2>/dev/null || return 0
+    for i in $(seq 1 20); do kill -0 "$p" 2>/dev/null || break; sleep 0.1; done
+    kill -0 "$p" 2>/dev/null && kill -KILL "$p" 2>/dev/null
+    wait "$p" 2>/dev/null
+}
+
 SHIM_MARK="# ngb-rsync-shim"
 cleanup() {
     [ -n "$T" ] || return 0
-    [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null
-    local bp; for bp in ${BG_PIDS[@]+"${BG_PIDS[@]}"}; do kill "$bp" 2>/dev/null; done      # by recorded PID, never by name
+    trap '' INT TERM HUP                       # a second Ctrl-C must not cut the cleanup short
+    reap_runs
+    [ -n "$DAEMON_PID" ] && stop_pid "$DAEMON_PID"
+    local bp; for bp in ${BG_PIDS[@]+"${BG_PIDS[@]}"}; do stop_pid "$bp"; done      # by recorded PID, never by name
     # Only mounts under "$T/", compared literally (no regex): an empty/odd $T must never match the host's mounts.
     awk -v t="$T" 'index($2, t "/") == 1 {print $2}' /proc/mounts | sort -r | while read -r m; do umount -l "$m"; done
     grep -qs "$SHIM_MARK" /usr/local/bin/rsync && rm -f /usr/local/bin/rsync
-    rm -f /etc/ngb-rsync-shim.conf /etc/cron.d/nas-sync /var/lock/nas-sync.lock
+    rm -f /etc/ngb-rsync-shim.conf
+    restore_cronfile
+    [ "$HAD_LOCKFILE" -eq 0 ] && rm -f /var/lock/nas-sync.lock
     if [ -f "$T/environment.bak" ]; then cp -a "$T/environment.bak" /etc/environment; else rm -f /etc/environment; fi
     [ "$HAD_USERAPP" -eq 0 ] && rm -rf /userapp
-    if [ "${NGB_KEEP:-0}" = 1 ]; then echo "workspace kept: $T"; else rm -rf "$T"; fi
+    if [ "${NGB_KEEP:-0}" != 1 ]; then
+        rm -rf "$T"
+    elif [ -n "${NGB_KEEP_DEST:-}" ] && mountpoint -q "$NGB_KEEP_DEST" 2>/dev/null; then
+        # docker mode: the container is deleted with its /tmp, so copy the workspace to the host directory mounted here
+        if cp -a "$T" "$NGB_KEEP_DEST/"; then echo "workspace kept: ${NGB_KEEP_HOST:-$NGB_KEEP_DEST}/${T##*/}"
+        else echo "workspace NOT kept: could not copy $T to $NGB_KEEP_DEST"; fi
+        rm -rf "$T"
+    else
+        echo "workspace kept: $T"
+    fi
 }
 trap cleanup EXIT
 # A shim left by an interrupted earlier run must not be mistaken for the real rsync.
@@ -262,7 +351,9 @@ if want names; then
     # the folder without any error), and bash 5.2 `read -d ''` loses the NEXT record after a name
     # ending in a UTF-8 lead byte (the Big5 fixture ends in 0xDA, so "folder" vanished). Every
     # folder is checked, not just the Big5 one, and the scripts must still exit 0.
-    if locale -a 2>/dev/null | grep -qiE '^c\.utf-?8$'; then
+    # No `grep -q` here: it exits at the first match, and a `locale -a` with more to print then dies of SIGPIPE, which
+    # `pipefail` turns into a failed condition: a false skip on a host with many locales. grep reads the whole list.
+    if locale -a 2>/dev/null | grep -iE '^c\.utf-?8$' >/dev/null; then
         DST2=$(fresh_dst names-utf8)
         LC_ALL=C.UTF-8 LOCAL_NAS_PATH="$DST2" PARALLEL_WORKERS=3 timeout --kill-after=10 300 "$S/nas-sync-parallel.sh" > "$T/names-utf8.log" 2>&1
         RC=$?
@@ -534,23 +625,35 @@ if want swap; then
     head2 "swap — chunk fetch overlapping the server's swap (§4.6, §8.3)"
     fresh_src
     for d in $(seq -w 1 300); do mkdir -p "$T/src/d$d"; (cd "$T/src/d$d" && touch $(seq -f 'f%02g' 1 80)); done
-    export SOURCE_PATH="$T/src" STATE_DIR="$T/src/.nas-sync-state" CHUNK_COUNT=24
+    # LOCK_HEARTBEAT=1: a generator run leaves the heartbeat's `sleep $LOCK_HEARTBEAT` behind after it releases the lock
+    # (lock_release kills the loop, not its sleep), so the default 60 would leave a `sleep 60` stray per run.
+    export SOURCE_PATH="$T/src" STATE_DIR="$T/src/.nas-sync-state" CHUNK_COUNT=24 LOCK_HEARTBEAT=1
     timeout --kill-after=10 300 "$S/generate-chunks.sh" > "$T/gen1.log" 2>&1
     check "generation 1 published" '[ -f "$STATE_DIR/common/chunks/chunks.meta" ]'
     for d in $(seq -w 1 300); do echo new > "$T/src/d$d/new-$d"; done      # shifts every round-robin slot
     sleep 1                                                                  # distinct generation id
     DST=$(fresh_dst swap)
     shim_set 60 "/common/chunks/"                                            # ~60 KB/s chunk fetch
-    PATH="$T/shim:$PATH" LOCAL_NAS_PATH="$DST" timeout --kill-after=10 300 "$S/nas-sync-parallel.sh" > "$T/swap.log" 2>&1 &
+    : > "$T/swap.marker"
+    PATH="$T/shim:$PATH" LOCAL_NAS_PATH="$DST" command timeout --kill-after=10 300 "$S/nas-sync-parallel.sh" > "$T/swap.log" 2>&1 &
     CPID=$!
-    for _ in $(seq 1 100); do
-        ls -A /tmp/nas-sync-parallel.*/chunks/ 2>/dev/null | grep -q . && break; sleep 0.1
-    done
+    # Wait until THIS client's work dir (created after the marker; the script names it /tmp/nas-sync-parallel.<pid>) holds
+    # fetched files. Not `ls -A /tmp/nas-sync-parallel.*/chunks/ | grep -q .`: with two or more such dirs (one left by an
+    # earlier killed run) ls prints a "<dir>:" header for each, even an empty one, so the wait ended at once and the
+    # swap below could fire before the fetch had begun, which proves nothing.
+    swap_fetching() {
+        local d
+        for d in $(find /tmp -maxdepth 1 -name 'nas-sync-parallel.*' -newer "$T/swap.marker" 2>/dev/null); do
+            [ -n "$(find "$d/chunks" -mindepth 1 -print -quit 2>/dev/null)" ] && return 0
+        done
+        return 1
+    }
+    for _ in $(seq 1 100); do swap_fetching && break; sleep 0.1; done
     sleep 1
     timeout --kill-after=10 300 "$S/generate-chunks.sh" > "$T/gen2.log" 2>&1                            # swap mid-fetch
     wait "$CPID"; RC=$?
     shim_off
-    unset SOURCE_PATH STATE_DIR CHUNK_COUNT
+    unset SOURCE_PATH STATE_DIR CHUNK_COUNT LOCK_HEARTBEAT
     MISSING=$(comm -23 <(files_of "$T/src") <(files_of "$DST") | wc -l)
     check "reconcile covers every path despite the mid-fetch swap (missing=$MISSING, rc=$RC)" '[ "$MISSING" -eq 0 ] && [ "$RC" -eq 0 ]'
     check "client never accepted a mixed set (retried or used one generation)" \
@@ -565,9 +668,9 @@ if want stale; then
         mkdir -p "$T/src/$d"; for n in 1 2 3; do echo "content of $d/$n" > "$T/src/$d/f$n.txt"; done
     done
     # ---- chunks: a real chunk set, then aged to 30 days (the default CHUNK_MAX_AGE is 24 h)
-    export SOURCE_PATH="$T/src" STATE_DIR="$T/src/.nas-sync-state" CHUNK_COUNT=4
+    export SOURCE_PATH="$T/src" STATE_DIR="$T/src/.nas-sync-state" CHUNK_COUNT=4 LOCK_HEARTBEAT=1     # 1: no `sleep 60` stray, see the swap case
     timeout --kill-after=10 300 "$S/generate-chunks.sh" > "$T/stale-gen.log" 2>&1
-    unset SOURCE_PATH STATE_DIR CHUNK_COUNT
+    unset SOURCE_PATH STATE_DIR CHUNK_COUNT LOCK_HEARTBEAT
     CMETA="$T/src/.nas-sync-state/common/chunks/chunks.meta"
     check "stale: a chunk set was published" '[ -f "$CMETA" ]'
     sed -i "s/^generated_at=.*/generated_at=$(( $(date +%s) - 2592000 ))/" "$CMETA"
@@ -626,7 +729,10 @@ if want lock; then
     head2 "lock — overlapping runs of the same generator (§4.3, §4.6, §4.7)"
     fresh_src
     for d in $(seq 1 200); do mkdir -p "$T/src/d$d"; (cd "$T/src/d$d" && touch $(seq -f 'f%g' 1 100)); done
-    export SOURCE_PATH="$T/src" STATE_DIR="$T/src/.nas-sync-state" REGISTRY_FILE="$T/clients.txt" CHUNK_COUNT=24
+    # LOCK_HEARTBEAT=1 for the whole case: lock_release kills the heartbeat loop but not its `sleep $LOCK_HEARTBEAT`, which
+    # outlives the run (and, at the default 60, the case and the suite). At 1 the strays end within a second; the few
+    # checks that depend on the default 60 say so (LOCK_STALE=08), and the stdout test reaps its own.
+    export SOURCE_PATH="$T/src" STATE_DIR="$T/src/.nas-sync-state" REGISTRY_FILE="$T/clients.txt" CHUNK_COUNT=24 LOCK_HEARTBEAT=1
     printf 'nas-a 100000\n' > "$REGISTRY_FILE"
     M="$STATE_DIR/clients/nas-a/sync-manifest.txt"
     # Baselines from solo runs.
@@ -640,7 +746,7 @@ if want lock; then
     chmod +x "$T/slowfind/find"
     for job in manifests chunks; do
         [ "$job" = manifests ] && GEN="$S/generate-manifests.sh" || GEN="$S/generate-chunks.sh"
-        PATH="$T/slowfind:$PATH" timeout --kill-after=10 300 "$GEN" > "$T/$job.a.log" 2>&1 & APID=$!
+        PATH="$T/slowfind:$PATH" command timeout --kill-after=10 300 "$GEN" > "$T/$job.a.log" 2>&1 & APID=$!
         sleep 1.5
         PATH="$T/slowfind:$PATH" timeout --kill-after=10 300 "$GEN" > "$T/$job.b.log" 2>&1; RCB=$?
         wait "$APID"; RCA=$?
@@ -673,21 +779,28 @@ if want lock; then
         '[ "$RC" -eq 75 ] && grep -qx "run_id=live-holder" "$STATE_DIR/locks/chunks.lock/owner" 2>/dev/null && grep -q "cannot determine the age" "$T/nomeasure.log"'
     rm -rf "$STATE_DIR/locks/chunks.lock"
 
-    # The heartbeat must survive a transient touch error. LOCK_HEARTBEAT=1 and the throttled find (a walk
-    # of a few seconds); the shim touch fails exactly once, on the first REFRESH of an existing
-    # .../heartbeat (the initial touch creates the file and passes). Sampled >= 2.5 s after the lock was
-    # taken, the heartbeat must be newer than acquisition + 1 s: the loop went on after the failure.
+    # The heartbeat must survive a transient touch error. LOCK_HEARTBEAT=1 and the throttled find (a walk of about
+    # 3 s); the shim touch fails exactly once, on the first REFRESH of an existing .../heartbeat (the initial touch
+    # creates the file and passes). After the failure the loop must go on: its next refresh (about +2 s) makes the
+    # heartbeat newer than acquisition + 1 s. Polled with a deadline, not sampled at a fixed instant (the old 2.5 s
+    # sample left ~0.5 s of margin on each side): a loop that died at the failure is seen as soon as the generator ends.
     mkdir -p "$T/hbtouch"
     printf '#!/bin/bash\nfor a in "$@"; do case "$a" in */heartbeat)\n  if [ -e "$a" ] && [ ! -e "%s/hb.failed" ]; then : > "%s/hb.failed"; exit 1; fi;;\nesac; done\nexec %s "$@"\n' \
         "$T" "$T" "$REAL_TOUCH" > "$T/hbtouch/touch"
     chmod +x "$T/hbtouch/touch"
     rm -f "$T/hb.failed"
-    LOCK_HEARTBEAT=1 PATH="$T/hbtouch:$T/slowfind:$PATH" timeout --kill-after=10 300 "$S/generate-chunks.sh" > "$T/hb.log" 2>&1 & HPID=$!
+    LOCK_HEARTBEAT=1 PATH="$T/hbtouch:$T/slowfind:$PATH" command timeout --kill-after=10 300 "$S/generate-chunks.sh" > "$T/hb.log" 2>&1 & HPID=$!
     OWNER_F="$STATE_DIR/locks/chunks.lock/owner"
     for _ in $(seq 1 100); do [ -e "$OWNER_F" ] && break; sleep 0.05; done
     ACQ=$(stat -c %.3Y "$OWNER_F" 2>/dev/null || echo 0)                     # lock acquisition time (NAS clock)
-    until awk -v a="$ACQ" -v n="$(date +%s.%N)" 'BEGIN{exit !(n >= a + 2.5)}'; do sleep 0.05; done
-    HB=$(stat -c %.3Y "$STATE_DIR/locks/chunks.lock/heartbeat" 2>/dev/null || echo 0)
+    HB=0
+    for _ in $(seq 1 400); do                                                # up to 20 s; the generator ends after ~3 s
+        h=$(stat -c %.3Y "$STATE_DIR/locks/chunks.lock/heartbeat" 2>/dev/null || echo 0)
+        [ "$h" != 0 ] && HB=$h                                               # the newest heartbeat seen (the file goes with the lock)
+        awk -v a="$ACQ" -v h="$HB" 'BEGIN{exit !(a > 0 && h > a + 1)}' && break
+        kill -0 "$HPID" 2>/dev/null || break
+        sleep 0.05
+    done
     wait "$HPID"; RC=$?
     check "heartbeat keeps running after a failed touch [rc=$RC, acquired=$ACQ, heartbeat=$HB]" \
         '[ "$RC" -eq 0 ] && [ -e "$T/hb.failed" ] && awk -v a="$ACQ" -v h="$HB" "BEGIN{exit !(a > 0 && h > a + 1)}" && grep -q "lock heartbeat touch failed" "$T/hb.log"'
@@ -725,37 +838,57 @@ if want lock; then
     # whole check ("value too great for base", no WARN, no reset), and `0120` read as 80 and was reset to 600/60
     # although 120/60 is valid. LOCK_STALE=08 (HEARTBEAT 60) is inconsistent: WARN and defaults, the 3 s-old lock holds.
     mklock 3 3
-    LOCK_STALE=08 timeout --kill-after=10 300 "$S/generate-chunks.sh" > "$T/octal8.log" 2>&1; RC=$?
+    LOCK_HEARTBEAT=60 LOCK_STALE=08 timeout --kill-after=10 300 "$S/generate-chunks.sh" > "$T/octal8.log" 2>&1; RC=$?
     check "LOCK_STALE=08 (leading zero): read as decimal 8 < 2 x 60: WARN says LOCK_STALE=8, defaults used, no arithmetic error, a 3 s-old lock holds (exit 75) [rc=$RC]" \
         '[ "$RC" -eq 75 ] && grep -q "LOCK_STALE=8 must be at least 2 x LOCK_HEARTBEAT" "$T/octal8.log" && ! grep -qiE "too great|syntax error|arithmetic" "$T/octal8.log" && grep -qx "run_id=live-holder" "$LOCKD/owner" 2>/dev/null'
-    # LOCK_STALE=0120 (HEARTBEAT 60) is valid: no WARN, and 120 is the threshold in force: a 130 s-old lock is broken.
+    # LOCK_STALE=0120 (HEARTBEAT 1, as everywhere in this case) is valid: no WARN, and 120 is the threshold in force: a 130 s-old lock is broken.
     mklock 130 130
     LOCK_STALE=0120 timeout --kill-after=10 300 "$S/generate-chunks.sh" > "$T/octal120.log" 2>&1; RC=$?
     check "LOCK_STALE=0120 (leading zero): read as decimal 120, no WARN, a 130 s-old lock is broken as stale > 120s (logged as 120s, not 0120s) [rc=$RC]" \
         '[ "$RC" -eq 0 ] && ! grep -q "must be at least" "$T/octal120.log" && grep -Eq "heartbeat 13[0-9]s ago > 120s" "$T/octal120.log"'
     rm -rf "$LOCKD"
     # M5: lock_release left the heartbeat's sleep running, and it held the job's stdout for up to LOCK_HEARTBEAT
-    # seconds: `generate-... | tee` stalled after the job had finished. With LOCK_HEARTBEAT=10 the pipeline must
-    # close within seconds of the generator's exit.
+    # seconds: `generate-... | tee` stalled after the job had finished. With LOCK_HEARTBEAT=10 the reader must see EOF
+    # within seconds of the generator's exit (the reader is a `cat` on a FIFO: it ends only when every holder of the
+    # write end has closed it). The run is started with `command timeout` and kept as a background job so that its group
+    # (timeout leads it) can be signalled afterwards: with the fix the heartbeat's `sleep 10` is still there, harmless but
+    # a stray, and the group TERM removes it. (Without the fix it has held the FIFO for ~10 s and the check fails.)
+    mkfifo "$T/pipe.fifo"
+    cat "$T/pipe.fifo" > "$T/pipe.log" & CATPID=$!
     t0=$(date +%s.%N)
-    LOCK_HEARTBEAT=10 timeout --kill-after=10 300 "$S/generate-chunks.sh" 2>&1 | cat > "$T/pipe.log"
+    LOCK_HEARTBEAT=10 command timeout --kill-after=10 300 "$S/generate-chunks.sh" > "$T/pipe.fifo" 2>&1 & GPID2=$!
+    wait "$CATPID"
     t1=$(date +%s.%N)
+    wait "$GPID2"
+    kill -TERM -- "-$GPID2" 2>/dev/null                              # reap the heartbeat's sleep, if it is still running
     HELD=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.1f", b - a}')
-    check "the heartbeat does not hold the job's stdout open after release (pipeline closed after ${HELD}s, LOCK_HEARTBEAT=10)" \
+    check "the heartbeat does not hold the job's stdout open after release (reader saw EOF after ${HELD}s, LOCK_HEARTBEAT=10)" \
         'grep -q "^.* - Done\.$" "$T/pipe.log" && awk -v h="$HELD" "BEGIN{exit !(h < 5)}"'
     # m3: a SIGKILLed holder's heartbeat loop must die with it, or the orphan keeps a dead run's lock fresh for ever.
-    # The generator runs in its own session (setsid), is killed 1 s after it took the lock, and the heartbeat must be
-    # frozen by the time we look (2.5 s later, LOCK_HEARTBEAT=1), and stay frozen.
+    # The generator runs in its own session (setsid) and is killed once the loop has refreshed the heartbeat (so it is
+    # alive when it loses its parent). A live loop touches every second (LOCK_HEARTBEAT=1): once the heartbeat has stood
+    # still for 2.5 s the loop is gone (polled with a deadline), and it must then STAY still for another 2.2 s: this last
+    # window is a "nothing happens" check, so it is inherently a fixed wait (a surviving loop touches twice in it).
     rm -rf "$LOCKD"
     LOCK_HEARTBEAT=1 PATH="$T/slowfind:$PATH" setsid "$S/generate-chunks.sh" > "$T/orphan.log" 2>&1 &
     disown $!                                                      # its SIGKILL below is expected: no job notice
     for _ in $(seq 1 100); do grep -q '^pid=' "$LOCKD/owner" 2>/dev/null && break; sleep 0.05; done
     GPID=$(sed -n 's/^pid=//p' "$LOCKD/owner" 2>/dev/null)
     GPG=$(ps -o pgid= -p "${GPID:-0}" 2>/dev/null | tr -d ' ')
-    sleep 1
+    ACQ2=$(stat -c %.3Y "$LOCKD/owner" 2>/dev/null || echo 0)
+    for _ in $(seq 1 100); do                                      # the loop's first refresh comes ~1 s after the lock was taken
+        h=$(stat -c %.3Y "$LOCKD/heartbeat" 2>/dev/null || echo 0)
+        awk -v a="$ACQ2" -v h="$h" 'BEGIN{exit !(a > 0 && h > a + 0.8)}' && break
+        sleep 0.05
+    done
     [ -n "$GPID" ] && kill -KILL "$GPID" 2>/dev/null
-    sleep 2.5
-    HB1=$(stat -c %.3Y "$LOCKD/heartbeat" 2>/dev/null || echo 0); sleep 2.2; HB2=$(stat -c %.3Y "$LOCKD/heartbeat" 2>/dev/null || echo 0)
+    HB1=0
+    for _ in $(seq 1 300); do                                      # up to 15 s
+        h=$(stat -c %.3Y "$LOCKD/heartbeat" 2>/dev/null || echo 0)
+        if awk -v h="$h" -v n="$(date +%s.%N)" 'BEGIN{exit !(h > 0 && n - h >= 2.5)}'; then HB1=$h; break; fi
+        sleep 0.05
+    done
+    sleep 2.2; HB2=$(stat -c %.3Y "$LOCKD/heartbeat" 2>/dev/null || echo 0)
     # remove what is left of the killed run (never our own process group)
     [ -n "$GPG" ] && [ "$GPG" != "$(ps -o pgid= -p $$ | tr -d ' ')" ] && kill -KILL -- "-$GPG" 2>/dev/null
     rm -rf "$LOCKD" "$STATE_DIR/common"/.chunks.tmp*
@@ -835,7 +968,10 @@ if want lock; then
     check "registry lookback 010 means 10 hours, not octal 8 (rc=$RC, window=${W010:-none}h)" \
         '[ "$RC" -eq 0 ] && [ "$W010" = 10 ] && grep -q "client=cl010 lookback=10h" "$T/oct2.log"'
     rm -rf "$RG"
-    unset SOURCE_PATH STATE_DIR REGISTRY_FILE CHUNK_COUNT
+    unset SOURCE_PATH STATE_DIR REGISTRY_FILE CHUNK_COUNT LOCK_HEARTBEAT
+    # The heartbeat sleeps of the last runs (LOCK_HEARTBEAT=1) end by themselves within a second: wait that out, so that
+    # nothing of this case is still running when the next one starts (or when the suite ends after `--case lock`).
+    sleep 1.2
 fi
 
 # ================================================================ signal
@@ -843,22 +979,52 @@ fi
 # mid-file, SIGTERM PID 1 (what kubelet does), and inspect the target.
 # SIG_AFTER=<seconds> (set in the caller's environment) sends the SIGTERM that long after the start
 # instead, for a signal that must land before rsync runs; no partial file is expected then.
+kill_container() {  # kill_container <unshare pid>: SIGKILL the namespace's PID 1 (the kernel then kills everything in it), then unshare
+    local u="$1" init
+    for init in $(pgrep -P "$u" 2>/dev/null); do kill -KILL "$init" 2>/dev/null; done
+    kill -KILL "$u" 2>/dev/null
+}
+# SIG_BOUND: how long after the SIGTERM the container may take to stop (whole seconds: `date +%s` quantises `took`).
+# A bound only means something relative to the rig, so it is not a free-standing number. Re-derive it, and the unit
+# counts that back it up (check_queue_skipped), if the shim bandwidth, the file size or the worker/unit counts of the
+# signal or deploy case change. In the signal case:
+#   - a file is 40 MB and the shim passes 4000 KB/s: one file takes ~10 s;
+#   - PARALLEL_WORKERS=2 over 4 units: two run when the TERM arrives, two are queued.
+# Measured: stopped correctly, the container ends 0-1 s after the TERM (rsync saves its partial and exits). With the
+# stop-file check removed (or the xargs in the foreground) the queued units start after the TERM, unsignalled, and each
+# runs its ~10 s: the container ends ~10 s after the TERM under `tini -g` (both units start together) and ~19 s without -g.
+# 15 s sits between those, but it separates them only WITHOUT -g. Under `tini -g`, which is how the images run, a broken
+# run stays under 15 s and passes the time check, so the parallel cases also count started and skipped units in the log.
+# More workers than units, a faster shim or smaller files shrink the broken run further. The deploy case's shim passes
+# 1000 KB/s, where an unsignalled sync runs ~40 s: there 15 s does separate.
+SIG_BOUND=15
 sigterm_run() {  # sigterm_run <label> <dst> <logfile> <tini flags> -- command...
     local label="$1" dst="$2" log="$3" tf="$4"; shift 5
     unshare --pid --fork --mount-proc tini $tf -- "$@" > "$log" 2>&1 &
-    local u=$! i tpid t0 t1
+    local u=$! i tpid t0 t1 rc
     if [ -n "${SIG_AFTER:-}" ]; then
         sleep "$SIG_AFTER"
     else
+        # Wait (up to 90 s) for rsync to be mid-file: a .blob* temp file in the target. The wait ends as soon as the
+        # container is gone: one that failed to start used to cost the full 90 s before it was reported.
+        # (-print -quit, not `find | grep -q .`: under pipefail a find that has more to print dies of SIGPIPE.)
         for i in $(seq 1 900); do
-            find "$dst" -name '.blob*' -type f 2>/dev/null | grep -q . && break; sleep 0.1
+            kill -0 "$u" 2>/dev/null || break
+            [ -n "$(find "$dst" -name '.blob*' -type f -print -quit 2>/dev/null)" ] && break
+            sleep 0.1
         done
         sleep 1
     fi
     tpid=$(pgrep -P "$u" -x tini | head -n 1)
     if [ -z "$tpid" ]; then
-        bad "$label: container did not start (no tini found)"
-        kill -KILL "$u" 2>/dev/null
+        if kill -0 "$u" 2>/dev/null; then
+            bad "$label: the container is running but has no tini process (unshare pid $u); see $log"
+            kill_container "$u"
+        else
+            wait "$u" 2>/dev/null; rc=$?
+            bad "$label: the container exited (rc=$rc) before the SIGTERM could be sent; last log line: $(tail -n 1 "$log" 2>/dev/null | cut -c1-160)"
+        fi
+        wait "$u" 2>/dev/null
         return 0
     fi
     t0=$(date +%s)
@@ -868,17 +1034,25 @@ sigterm_run() {  # sigterm_run <label> <dst> <logfile> <tini flags> -- command..
     if kill -0 "$u" 2>/dev/null; then
         # PID 1 of the namespace ignored SIGTERM: SIGKILL it (the kernel then kills everything
         # inside the namespace), then the unshare process.
-        kill -KILL "$tpid" 2>/dev/null; kill -KILL "$u" 2>/dev/null
+        kill_container "$u"
         echo "(killed after 60s)" >> "$log"
     fi
+    wait "$u" 2>/dev/null
     local orphans partials took=$(( t1 - t0 ))
     # Parallel runs have more units than workers: queued units must be skipped, not started.
-    check "$label: stopped within 15 s of SIGTERM (took ${took}s)" '[ "$took" -le 15 ]'
+    check "$label: stopped within $SIG_BOUND s of SIGTERM (took ${took}s)" '[ "$took" -le "$SIG_BOUND" ]'
     orphans=$(find "$dst" -name '.blob*' -type f ! -path '*/.rsync-partial/*' | wc -l)
     partials=$(find "$dst" -path '*/.rsync-partial/*' -type f | wc -l)
     check "$label: no orphan .<file>.XXXXXX temp file left in the target (found $orphans)" '[ "$orphans" -eq 0 ]'
     [ -n "${SIG_AFTER:-}" ] || check "$label: interrupted file kept in .rsync-partial/ (found $partials)" '[ "$partials" -ge 1 ]'
     check "$label: status file records the interruption" 'grep -q "interrupted=TERM" "$dst/.nas-sync-status/last-run" 2>/dev/null'
+}
+
+check_queue_skipped() {  # check_queue_skipped <label> <logfile> <unit name prefix: folder# | chunk->
+    local ns nk
+    ns=$(grep -c "\[worker\] START $3" "$2"); nk=$(grep -c "\[worker\] SKIP  $3" "$2")
+    check "$1: the 2 running units were stopped and the 2 queued ones skipped, not started (started=$ns, skipped=$nk)" \
+        '[ "$ns" -eq 2 ] && [ "$nk" -eq 2 ]'
 }
 
 if want signal; then
@@ -894,7 +1068,26 @@ if want signal; then
             DST=$(fresh_dst "sig-${mode}${tf}")
             PATH="$T/shim:$PATH" SYNC_MODE=$mode LOCAL_NAS_PATH="$DST" PARALLEL_WORKERS=2 ISTIO_ADMIN_PORT=1 \
                 sigterm_run "tini ${tf:-(no -g)} $mode" "$DST" "$T/sig-$mode$tf.log" "$tf" -- "$S/run-with-sidecar-quit.sh"
+            # The time bound alone cannot see a missing stop-file check under tini -g (see SIG_BOUND): count the units.
+            [ "$mode" = parallel ] && check_queue_skipped "tini ${tf:-(no -g)} $mode" "$T/sig-$mode$tf.log" 'folder#'
         done
+    done
+    # The same stop on the CHUNK path (§8.3). The runs above take the top-level fallback ("No chunk lists available",
+    # nothing is published), which dispatches sync_one_folder. With chunk lists published, parallel mode dispatches
+    # sync_one_chunk instead, with its own stop-file check and its own background xargs, and nothing above exercises them:
+    # remove either and the matrix stayed green. 4 files, CHUNK_COUNT=4: one file per chunk, so with 2 workers two chunks
+    # run and two are queued when the TERM arrives, and a correct stop starts exactly 2 and skips exactly 2. (The log
+    # count does not depend on SIG_BOUND, which a broken run could stay under: see its comment.)
+    SOURCE_PATH="$T/src" STATE_DIR="$T/src/.nas-sync-state" CHUNK_COUNT=4 LOCK_HEARTBEAT=1 \
+        timeout --kill-after=10 300 "$S/generate-chunks.sh" > "$T/sig-chunk-gen.log" 2>&1
+    for tf in "-g" ""; do
+        lbl="tini ${tf:-(no -g)} parallel, chunk path"
+        DST=$(fresh_dst "sig-chunks${tf}")
+        PATH="$T/shim:$PATH" SYNC_MODE=parallel LOCAL_NAS_PATH="$DST" PARALLEL_WORKERS=2 ISTIO_ADMIN_PORT=1 \
+            sigterm_run "$lbl" "$DST" "$T/sig-chunks$tf.log" "$tf" -- "$S/run-with-sidecar-quit.sh"
+        check "$lbl: the chunk path ran (4 server-generated chunks, no top-level fallback)" \
+            'grep -q "Using 4 server-generated chunks" "$T/sig-chunks$tf.log" && ! grep -q "falling back to top-level split" "$T/sig-chunks$tf.log"'
+        check_queue_skipped "$lbl" "$T/sig-chunks$tf.log" 'chunk-'
     done
     # SIGTERM while the pre-flight is still running (a slow `mountpoint` on a stale NFS mount): the
     # signal only sets a flag, so the mode script must check it before it starts rsync. ~2 MB/s
@@ -907,8 +1100,14 @@ if want signal; then
     DST=$(fresh_dst "sig-preflight")
     PATH="$T/shim-mp:$T/shim:$PATH" SYNC_MODE=standard LOCAL_NAS_PATH="$DST" ISTIO_ADMIN_PORT=1 SIG_AFTER=2 \
         sigterm_run "SIGTERM during pre-flight" "$DST" "$T/sig-preflight.log" "-g" -- "$S/run-with-sidecar-quit.sh"
-    BLOBS=$(find "$DST" -name '.blob*' | wc -l)
-    check "SIGTERM during pre-flight: rsync never started (no .blob* file in the target, found $BLOBS)" '[ "$BLOBS" -eq 0 ]'
+    # sigterm_run already counts orphan temp files. This checks what the old `.blob*` count could not say (that finds the
+    # temp file of a SIGKILLed rsync, not a partial saved in .rsync-partial/): the flag set by the TERM is acted on at
+    # the very next step. The line after "OK Pre-flight" is the interruption (the script logs "OK Pre-flight" when the
+    # slow `mountpoint` returns, then check_term exits before rsync), and the target holds nothing but the status dir.
+    NEXTLINE=$(awk '/OK Pre-flight/{f=1; next} f{print; exit}' "$T/sig-preflight.log")
+    OTHER=$(find "$DST" -mindepth 1 ! -path "$DST/.nas-sync-status" ! -path "$DST/.nas-sync-status/*" | wc -l)
+    check "SIGTERM during pre-flight: the run stops right after the pre-flight, before rsync (the line after 'OK Pre-flight' is the interruption; the target holds nothing but .nas-sync-status/, found $OTHER other entries)" \
+        '[[ "$NEXTLINE" == *"Interrupted (SIGTERM)"* ]] && [ "$OTHER" -eq 0 ]'
     shim_off
 
     # The same stop, 25 times, in the fast-exit case. Under `tini -g` the dispatcher gets two TERMs within milliseconds
@@ -921,10 +1120,13 @@ if want signal; then
     # `mountpoint`: that runs under `timeout`, which gives it its own process group, so the group
     # TERM never reaches it and the mode script only exits when the shim ends, seconds after the
     # signals. A foreground `sleep` in the pre-flight does get the group TERM, so the mode script
-    # exits within milliseconds of the two TERMs - the window the race needs (about a third of
-    # the runs fail on a dispatcher without the v3.16 round-2 fixes: exit 255 from
-    # `exit=-1`, or a negative elapsed because a late group TERM killed `date`).
-    # SIGTERM goes in 1 s after the start.
+    # exits within milliseconds of the two TERMs - the window the race needs. Measured on a dispatcher without the
+    # `wait_child` and `trap '' TERM INT` fixes: 26% of 275 runs failed in one series and 34% of 120 in another (28% of
+    # 395 together; it varies with load): exit 255 from `exit=-1`, or a negative elapsed because a late group TERM killed
+    # `date`. So 25 runs miss a regression less than 0.1% of the time without being slow.
+    # SIGTERM goes in 1 s after the start. The chain reaches the retry sleep within ~30 ms (40 runs: mean 27 ms, max
+    # 51 ms), so 1 s is ample, and 1.5 s did not expose the race more (34% vs 28% failing in 120 runs each, on the
+    # regressed dispatcher: the same within noise) while adding 12 s: it stays 1 s.
     DST=$(fresh_dst "sig-loop")
     LOOP_N=25; LOOP_OK=0; LOOP_BAD=""
     for i in $(seq 1 "$LOOP_N"); do
@@ -937,7 +1139,7 @@ if want signal; then
         [ -n "$tpid" ] && kill -TERM "$tpid"
         for _ in $(seq 1 200); do kill -0 "$u" 2>/dev/null || break; sleep 0.1; done
         if kill -0 "$u" 2>/dev/null; then
-            kill -KILL "$tpid" 2>/dev/null; kill -KILL "$u" 2>/dev/null; echo "(killed after 20s)" >> "$T/sig-loop-$i.log"
+            kill_container "$u"; echo "(killed after 20s)" >> "$T/sig-loop-$i.log"
         fi
         wait "$u" 2>/dev/null; loop_rc=$?
         if [ "$loop_rc" -eq 143 ] \
@@ -1001,7 +1203,7 @@ PEOF
     tpid=$(pgrep -P "$u" -x tini | head -n 1)
     [ -n "$tpid" ] && kill -TERM "$tpid"
     for _ in $(seq 1 100); do kill -0 "$u" 2>/dev/null || break; sleep 0.1; done
-    kill -0 "$u" 2>/dev/null && { kill -KILL "$tpid" "$u" 2>/dev/null; echo "(killed after 10s)" >> "$T/quitphase.log"; }
+    kill -0 "$u" 2>/dev/null && { kill_container "$u"; echo "(killed after 10s)" >> "$T/quitphase.log"; }
     wait "$u" 2>/dev/null; QRC=$?
     bg_stop "$SPID"
     check "TERM during the sidecar-quit phase does not re-enter the sync trap and keeps the sync's exit status 0 (rc=$QRC)" \
@@ -1031,10 +1233,14 @@ if [ "$SLOW" -eq 1 ] && want deploy; then
         # (b) during a cron-launched run: quick initial sync, then a big file for the cron run
         fresh_src; echo tiny > "$T/src/tiny.txt"
         DST=$(fresh_dst dep-cron)
+        # The helper that drops the big file in once the initial sync is done is registered and stopped (bg_add/bg_stop):
+        # if the entrypoint never logs 'Initial sync done' it would otherwise wait out its 60 s loop and then write into
+        # a workspace that cleanup has already removed.
         ( for _ in $(seq 1 300); do grep -q 'Initial sync done' "$T/dep-cron.log" 2>/dev/null && break; sleep 0.2; done
-          mkdir -p "$T/src/big"; head -c 40000000 /dev/urandom > "$T/src/big/blob.bin" ) &
+          mkdir -p "$T/src/big"; head -c 40000000 /dev/urandom > "$T/src/big/blob.bin" ) & HELPER=$!; bg_add "$HELPER"
         SYNC_MODE=standard LOCAL_NAS_PATH="$DST" CRON_SCHEDULE='* * * * *' \
             sigterm_run "Deployment, cron-launched run" "$DST" "$T/dep-cron.log" "-g" -- "$S/entrypoint-deployment.sh"
+        bg_stop "$HELPER"
         # (c) SIGTERM right at the start, before the initial sync has been forked. A TERM that lands
         # after the trap is installed and before the fork finds nothing to signal; an entrypoint that
         # then starts the (unbounded) sync anyway never stops it, and the pod's SIGKILL leaves a temp
@@ -1044,8 +1250,8 @@ if [ "$SLOW" -eq 1 ] && want deploy; then
         # entrypoint inside the window; the TERM goes out as soon as the shim's marker file shows it is
         # holding (polled, up to 5 s, so a slow machine only takes longer). If the marker never shows,
         # the TERM is sent anyway and the run fails loudly with held=no.
-        # The slow rsync shim makes a sync that does start outlast the 15 s limit. A run counts as
-        # clean only if the container stopped within 15 s, exited 143 and left no temp file, AND it
+        # The slow rsync shim makes a sync that does start outlast the SIG_BOUND limit (15 s; see its comment). A run counts as
+        # clean only if the container stopped within SIG_BOUND, exited 143 and left no temp file, AND it
         # really reached the window: the shim held the ENTRYPOINT's date call (the marker names its
         # command line) and the trap handled the TERM (otherwise the run proves nothing: a changed
         # log line, or a log() that no longer forks date).
@@ -1060,23 +1266,23 @@ if [ "$SLOW" -eq 1 ] && want deploy; then
             for _ in $(seq 1 100); do [ -s "$T/dep-early-$i.held" ] && break; sleep 0.05; done
             tpid=$(pgrep -P "$u" -x tini | head -n 1)
             if [ -z "$tpid" ]; then
-                EARLY_BAD="$EARLY_BAD $i(no tini)"; kill -KILL "$u" 2>/dev/null; wait "$u" 2>/dev/null; continue
+                EARLY_BAD="$EARLY_BAD $i(no tini)"; kill_container "$u"; wait "$u" 2>/dev/null; continue
             fi
             t0=$(date +%s); kill -TERM "$tpid"
             for _ in $(seq 1 200); do kill -0 "$u" 2>/dev/null || break; sleep 0.1; done
             took=$(( $(date +%s) - t0 ))
-            kill -0 "$u" 2>/dev/null && kill -KILL "$tpid" "$u" 2>/dev/null
+            kill -0 "$u" 2>/dev/null && kill_container "$u"
             wait "$u" 2>/dev/null; erc=$?
             orph=$(find "$DST" -name '.blob*' -type f ! -path '*/.rsync-partial/*' | wc -l)
             held=no;   grep -q entrypoint-deployment "$T/dep-early-$i.held" 2>/dev/null && held=yes   # the shim parked the entrypoint
             ontrap=no; grep -qF 'stopping cron, signalling' "$elog" && ontrap=yes      # and the trap handled the TERM
-            if [ "$took" -le 15 ] && [ "$erc" -eq 143 ] && [ "$orph" -eq 0 ] && [ "$held" = yes ] && [ "$ontrap" = yes ]; then
+            if [ "$took" -le "$SIG_BOUND" ] && [ "$erc" -eq 143 ] && [ "$orph" -eq 0 ] && [ "$held" = yes ] && [ "$ontrap" = yes ]; then
                 EARLY_OK=$((EARLY_OK+1))
             else
                 EARLY_BAD="$EARLY_BAD $i(took=${took}s rc=$erc orphans=$orph held=$held ontrap=$ontrap)"
             fi
         done
-        check "Deployment, SIGTERM right at start: $EARLY_OK/$EARLY_N runs stopped cleanly within 15 s${EARLY_BAD:+ — failed:$EARLY_BAD}" \
+        check "Deployment, SIGTERM right at start: $EARLY_OK/$EARLY_N runs stopped cleanly within $SIG_BOUND s${EARLY_BAD:+ — failed:$EARLY_BAD}" \
             '[ "$EARLY_OK" -eq "$EARLY_N" ]'
         # (d) a cron-launched run whose rsync cleanup is SLOW. On a TERM, rsync keeps the partial by
         # closing the temp file, creating .rsync-partial/ and renaming the temp file into it. A SECOND
@@ -1151,10 +1357,11 @@ CEOF
             fresh_src; echo tiny > "$T/src/tiny.txt"
             DST=$(fresh_dst dep-slow)
             ( for _ in $(seq 1 300); do grep -q 'Initial sync done' "$T/dep-slow.log" 2>/dev/null && break; sleep 0.2; done
-              mkdir -p "$T/src/big"; head -c 40000000 /dev/urandom > "$T/src/big/blob.bin" ) &
+              mkdir -p "$T/src/big"; head -c 40000000 /dev/urandom > "$T/src/big/blob.bin" ) & HELPER=$!; bg_add "$HELPER"
             shim_set 4000 "" "$STALL_SO" "$STALL_MS"
             SYNC_MODE=standard LOCAL_NAS_PATH="$DST" CRON_SCHEDULE='* * * * *' \
                 sigterm_run "Deployment, cron-launched run, slow cleanup" "$DST" "$T/dep-slow.log" "-g" -- "$S/entrypoint-deployment.sh"
+            bg_stop "$HELPER"
             # Without this the four checks above pass vacuously whenever the preload does not load
             # (ld.so only warns, e.g. on a noexec /tmp) or never fires: the run is then a plain single-TERM run.
             check "Deployment, cron-launched run, slow cleanup: the preload really stalled rename() (marker)" '[ -e "$T/stall.mark" ]'
@@ -1162,7 +1369,7 @@ CEOF
         # The cron daemon lived inside the PID namespace and died with its PID 1.
         shim_off
         grep -qs "$SHIM_MARK" /usr/local/bin/rsync && rm -f /usr/local/bin/rsync
-        rm -f /etc/cron.d/nas-sync
+        restore_cronfile                                                  # a cron file that existed before the suite is put back
     fi
 fi
 

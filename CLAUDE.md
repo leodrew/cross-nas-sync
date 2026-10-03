@@ -91,6 +91,7 @@ bash scripts/check-guide.sh <guide.md>           # a specific one
 bash scripts/test-guide-behavior.sh              # in docker (default; works from Windows)
 bash scripts/test-guide-behavior.sh --slow       # + the Deployment/cron case (~2-3 min more)
 bash scripts/test-guide-behavior.sh --native     # disposable Linux container/CI only (needs root; --slow also wants cron, and cc for one sub-case)
+NGB_KEEP=1 bash scripts/test-guide-behavior.sh ...  # keep the workspace and the log of every run (docker mode: copied to $NGB_KEEP_DIR, default /tmp/ngb-keep)
 ```
 
 It verifies: CR bytes, `bash -n` on every fenced bash block, YAML parse on every fenced yaml block, absence of `--delete`, placeholder integrity, that every `§ref` resolves to a real heading, that every defined file appears in the §14 checklist, and that each v3.15 and v3.16 defect fix is still present. Needs `pyyaml` for full YAML parsing (`pip install pyyaml`); degrades to a structural check without it.

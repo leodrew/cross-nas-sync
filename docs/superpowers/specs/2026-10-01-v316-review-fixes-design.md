@@ -457,7 +457,8 @@ signals and PID 1. The harness turns the reproductions behind this spec into a r
   works from Windows/MSYS and never touches the host.
 - **`--native`:** runs on a Linux host as root, for CI or a sandbox.
 - **Needs:** rsync, tini, perl, unshare, nc, flock, pgrep, comm, mount, mountpoint, timeout; cron for `--slow`, and a C compiler for the `deploy` slow-cleanup sub-case (skipped without one; with `--case deploy` that skip makes the run exit 2). Three more sub-checks skip with a WARN when their tool is missing, and exit 2 under a `--case` that asked for them: `dash` (the `build` case), the user `nobody` (the `names` case runs a second daemon as that user to make a directory unreadable for verify), and a `C.UTF-8` locale (the UTF-8 sub-checks of `names`).
-- A case is skipped with a WARN only when its tool is missing.
+- A case is skipped with a WARN only when its tool is missing, or (`deploy`) when a cron daemon is already running
+  or `/usr/local/bin/rsync` already exists and is not this suite's shim.
 
 | Case | Asserts |
 |---|---|
@@ -489,16 +490,30 @@ defects; it is recorded in the implementation plan's verification step.
   top-level dirs listed` only when the source is already empty at the listing, and end `VERIFY OK` if it empties
   after it (each slice folder is skipped as removed). The server has no guard: §4.2 logs a WARN if
   `/mnt/nas-source` is not a mountpoint at start-up and carries on, and nothing re-checks it. Guide §12.1.
-- A registry `lookback_hours` of 19 or more digits wraps silently in `$(( ))` (a far-future threshold, so an
-  empty manifest for that client, with no WARN). The weekly reconcile compensates.
+- A registry `lookback_hours` above about 2.56e15 (16 or more digits; `HOURS * 3600` then exceeds 2^63) wraps
+  silently in `$(( ))`, with no WARN: for most values to a far-future threshold and so an empty manifest for that
+  client, for some (for example 18 nines) to a negative one and so the whole tree. The weekly reconcile
+  compensates.
 - verify's vanished-folder allow-list matches rsync 3.2.7's message text. On another rsync a vanished folder fails the
   run with the "part of it could not be read" message; the 20 stderr lines printed beneath it show the real cause.
 - If cron exits unexpectedly the §8.7 entrypoint exits 1 so the pod restarts, which kills any in-flight run
   (unchanged from v3.15).
-- The `kubectl run … --rm -it` throw-away pods in guide §11 and §13 carry no Istio opt-out annotation. Where the
-  namespace injects a sidecar into them they may not finish; unverified without a cluster.
+- The `kubectl run … --rm -it` throw-away pods in guide §11 and §13 and runbook S1 and S11 carry no Istio opt-out
+  annotation. Where the namespace injects a sidecar into them they may not finish; unverified without a cluster.
 - Two runs that sweep or break the same displaced lock within milliseconds can both log "Removed …", and a
   breaker can log "another run holds the name" where "held by" would be accurate. No state is harmed.
+- A sync an operator starts by hand in a running pod (`kubectl exec … dispatch-sync.sh`) is not reliably stopped
+  by a pod deletion. The §8.7 entrypoint's `on_term` finds runs by their `dispatch-sync.sh` command line and
+  signals their process group, but the group of an exec'd process may show as 0 in the pod's PID namespace
+  (reasoned in the Task 7 review, not tested); in a CronJob pod the §8.6 wrapper signals only its own group,
+  which an exec'd run is not in. At worst the run is killed with the container at the end of the grace period,
+  which is what every run got in v3.15.
+- After a TERM, each queued parallel unit (a chunk list, or a top-level folder in the fallback) still forks one
+  `bash -c` that logs `SKIP` and records rc 143; no rsync starts. Measured at about 0.75 ms per unit (10000 units:
+  7.4 s); the chunk path has about 24 units.
+- §8.4 checks for a TERM once more than strictly needed, before `run_full_sync` in its `FULL_SYNC` branch (the
+  check before it, after the manifest.meta fetch, is followed by several forks: the stale test, `grep`, `log`).
+  Harmless, kept.
 
 ---
 

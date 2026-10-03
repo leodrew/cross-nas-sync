@@ -2292,7 +2292,8 @@ docker run --rm ${REGISTRY}/nas-sync-client:3.16 sh -c \
 > **It also fails when it could not compare everything.** An rsync exit 23 (a directory of the
 > source could not be read) fails the run with exit 23 instead of passing it with a smaller
 > `drift` count, and a `VERIFY_MODE`, `VERIFY_SLICES` or `VERIFY_FAIL_THRESHOLD` that is not
-> valid fails it with exit 1 before anything is compared. rc 24 (an entry vanished mid-scan)
+> valid fails it with exit 1 before anything is compared (`VERIFY_SLICES` only when the mode
+> includes the checksum tier). rc 24 (an entry vanished mid-scan)
 > is still normal. Details and the fix for an entry that is permanently unreadable: §13,
 > "Drift detected".
 
@@ -3288,8 +3289,10 @@ kubectl get pod $POD -n ea-pmc -w
 # Logs from main container
 kubectl logs $POD -n ea-pmc -c nas-sync-client
 
-# Confirm shebang clean (CRLF fix worked)
-kubectl exec $POD -n ea-pmc -c nas-sync-client -- head -1 /userapp/scripts/dispatch-sync.sh | cat -A
+# Confirm shebang clean (CRLF fix worked). The test Job's pod has finished, and kubectl refuses
+# exec into a completed pod ("cannot exec into a container in a completed pod"), so check the
+# same image in a throw-away pod (REGISTRY is the one from §3):
+kubectl run shebang --rm -it --restart=Never -n ea-pmc --image=${REGISTRY}/nas-sync-client:3.16 --command -- sh -c 'head -1 /userapp/scripts/dispatch-sync.sh | cat -A'
 # Expected: #!/bin/bash$ (no ^M)
 
 kubectl delete job test-v315 -n ea-pmc
@@ -3310,7 +3313,7 @@ kubectl logs $POD -n ea-pmc -c nas-sync-client | grep -E 'client=|Incremental:|F
 #    this target's PVC). With a Deployment pod running you can instead
 #    kubectl exec <pod> -n ea-pmc -c nas-sync-client -- cat /mnt/nas-target/.nas-sync-status/last-run
 kubectl run tmp-status --rm -it --restart=Never --image=busybox -n ea-pmc \
-  --overrides='{"spec":{"volumes":[{"name":"nas","persistentVolumeClaim":{"claimName":"nas-a-target-pvc"}}],"containers":[{"name":"tmp","image":"busybox","command":["sh","-c","cat /mnt/.nas-sync-status/last-run /mnt/.nas-sync-status/last-success"],"volumeMounts":[{"name":"nas","mountPath":"/mnt"}]}]}}'
+  --overrides='{"spec":{"volumes":[{"name":"nas","persistentVolumeClaim":{"claimName":"nas-a-target-pvc"}}],"containers":[{"name":"tmp-status","image":"busybox","command":["sh","-c","cat /mnt/.nas-sync-status/last-run /mnt/.nas-sync-status/last-success"],"volumeMounts":[{"name":"nas","mountPath":"/mnt"}]}]}}'
 #    Expected: two lines (last-run, then last-success):
 #    ts=... mode=incremental client=nas-a exit=0 elapsed=...s host=...
 
@@ -3385,7 +3388,7 @@ kubectl delete job term-test -n ea-pmc          # stop the replacement pod the J
 #    nas-a-target-pvc = this target's PVC; with a Deployment pod running you can instead
 #    kubectl exec <pod> -n ea-pmc -c nas-sync-client -- cat /mnt/nas-target/.nas-sync-status/last-run):
 kubectl run tmp-status --rm -it --restart=Never --image=busybox -n ea-pmc \
-  --overrides='{"spec":{"volumes":[{"name":"nas","persistentVolumeClaim":{"claimName":"nas-a-target-pvc"}}],"containers":[{"name":"tmp","image":"busybox","command":["cat","/mnt/.nas-sync-status/last-run"],"volumeMounts":[{"name":"nas","mountPath":"/mnt"}]}]}}'
+  --overrides='{"spec":{"volumes":[{"name":"nas","persistentVolumeClaim":{"claimName":"nas-a-target-pvc"}}],"containers":[{"name":"tmp-status","image":"busybox","command":["cat","/mnt/.nas-sync-status/last-run"],"volumeMounts":[{"name":"nas","mountPath":"/mnt"}]}]}}'
 #    Expected: … exit=143 … interrupted=TERM
 
 # 4. Behavior suite (runs on a workstation with docker, not the cluster): every v3.16 fix
@@ -3404,13 +3407,13 @@ kubectl logs -f deployment/nas-sync-client-deploy -n ea-pmc -c nas-sync-client
 
 ```bash
 kubectl run tmp-write --rm -it --restart=Never --image=busybox -n ea-pmc \
-  --overrides='{"spec":{"volumes":[{"name":"nas","persistentVolumeClaim":{"claimName":"nas-a-target-pvc"}}],"containers":[{"name":"tmp","image":"busybox","command":["sh","-c","echo keep > /mnt/.nodelete && echo OK"],"volumeMounts":[{"name":"nas","mountPath":"/mnt"}]}]}}'
+  --overrides='{"spec":{"volumes":[{"name":"nas","persistentVolumeClaim":{"claimName":"nas-a-target-pvc"}}],"containers":[{"name":"tmp-write","image":"busybox","command":["sh","-c","echo keep > /mnt/.nodelete && echo OK"],"volumeMounts":[{"name":"nas","mountPath":"/mnt"}]}]}}'
 
 kubectl create job --from=cronjob/nas-sync-client nodelete-test -n ea-pmc
 kubectl wait --for=condition=complete job/nodelete-test -n ea-pmc --timeout=600s
 
 kubectl run tmp-read --rm -it --restart=Never --image=busybox -n ea-pmc \
-  --overrides='{"spec":{"volumes":[{"name":"nas","persistentVolumeClaim":{"claimName":"nas-a-target-pvc"}}],"containers":[{"name":"tmp","image":"busybox","command":["cat","/mnt/.nodelete"],"volumeMounts":[{"name":"nas","mountPath":"/mnt"}]}]}}'
+  --overrides='{"spec":{"volumes":[{"name":"nas","persistentVolumeClaim":{"claimName":"nas-a-target-pvc"}}],"containers":[{"name":"tmp-read","image":"busybox","command":["cat","/mnt/.nodelete"],"volumeMounts":[{"name":"nas","mountPath":"/mnt"}]}]}}'
 # Expected: keep
 kubectl delete job nodelete-test -n ea-pmc
 ```
@@ -3489,8 +3492,10 @@ The server has no guard against this: §4.2 tests `mountpoint` once at start-up 
 WARN (`NAS not detected as mountpoint`); it does not stop the daemon, and nothing re-checks
 the mount while the daemon runs. Nothing is lost on the target (the sync never removes
 target-only files), but a green verify proves nothing about a source that went empty. Watch
-the server pod's start-up log for that WARN, and treat `No folders found` from `parallel`'s
-fallback or a manifest with `file_count=0` (`manifest.meta`) as the same symptom.
+the server pod's start-up log for that WARN. The symptoms downstream are `No folders found`
+from `parallel`'s fallback and, for `incremental`, `Manifest fetch failed (rc=…) — FULL sync
+fallback` (the daemon's view has no `.nas-sync-state/`). A manifest with `file_count=0` is not a
+reliable sign: a quiet lookback window gives 0 too, and the generator pods mount the NAS directly.
 
 ---
 
@@ -3637,7 +3642,7 @@ Correct the value in the CronJob (§9A.5) and re-run.
 # A CronJob-only target has no running client pod to exec into. Read the files with a
 # throw-away pod that mounts the target PVC (nas-a-target-pvc = this target's PVC, §9A.1):
 kubectl run tmp-status --rm -it --restart=Never --image=busybox -n ea-pmc \
-  --overrides='{"spec":{"volumes":[{"name":"nas","persistentVolumeClaim":{"claimName":"nas-a-target-pvc"}}],"containers":[{"name":"tmp","image":"busybox","command":["sh","-c","cat /mnt/.nas-sync-status/last-run /mnt/.nas-sync-status/last-success"],"volumeMounts":[{"name":"nas","mountPath":"/mnt"}]}]}}'
+  --overrides='{"spec":{"volumes":[{"name":"nas","persistentVolumeClaim":{"claimName":"nas-a-target-pvc"}}],"containers":[{"name":"tmp-status","image":"busybox","command":["sh","-c","cat /mnt/.nas-sync-status/last-run /mnt/.nas-sync-status/last-success"],"volumeMounts":[{"name":"nas","mountPath":"/mnt"}]}]}}'
 # With a running client pod (a Deployment pod, or a CronJob pod while it runs) you can exec instead:
 kubectl exec <running-pod> -n ea-pmc -c nas-sync-client -- \
   sh -c 'cat /mnt/nas-target/.nas-sync-status/last-run; cat /mnt/nas-target/.nas-sync-status/last-success'
@@ -3662,8 +3667,8 @@ Messages and causes:
 | Log line | Cause | Fix |
 |---|---|---|
 | `No chunk lists available (rc=…)` | Chunk CronJob never ran, or `.nas-sync-state/common/chunks/` unreadable, or the fetch hit its idle timeout (`rc=30`: no data for `RSYNC_LIST_TIMEOUT`, default 300s) | Run §6.3 job; confirm the source mount is `readOnly: false`; for `rc=30` check the connection to the server (the run fell back to the top-level split) |
-| `Chunks are stale (age=… > …)` | Chunk job failed the last N weeks | List the chunk Jobs with the command in "Generator Job Failed" below (`grep nas-sync-chunks`) and read the latest one's log |
-| `WARN: CHUNK_MAX_AGE='…' is not a non-negative integer — using 86400` | The setting is not a whole number of seconds (`24h`, `1.5`, `-5`) | Correct the value where you set it (a CronJob `env` entry, §9A.2/§9A.4, or the image's `ENV`, §8.8). Until then the 24h default applies: before v3.16 a bad value silently turned the staleness check off |
+| `Chunks are stale (age=… > …)` | Chunk job failed the last N weeks | List the chunk Jobs with the command in "Generator Job Failed" below (filter: `grep -E 'CRONJOB|nas-sync-chunks'`) and read the latest one's log |
+| `WARN: CHUNK_MAX_AGE='…' is not a non-negative integer — using 86400` | The setting is not a whole number of seconds (`24h`, `1.5`, `-5`) | Correct the value where you set it (a CronJob `env` entry, §9A.2/§9A.4, or the image's `ENV`, §8.8). Until then the 24h default applies: before v3.16 a bad value turned the staleness check off, or on for ever (`-5`) |
 | `chunks.meta present but no chunk files` | A v3.15-format set (no generation in `chunks.meta`) lost its chunk files — the chunk job was interrupted mid-publish; a v3.16 set in that state reports `Chunk set inconsistent` | Re-run the chunk job; the next run self-heals |
 | `Chunk files vanished mid-fetch (rc=24)` | The fetch overlapped the chunk job's swap (v3.16) | Nothing — the client retries once after `CHUNK_RETRY_WAIT` (30s) and uses the new generation; if the retry fails too, the run falls back to the top-level split |
 | `Chunk set inconsistent (generation …)` | Same, caught by the generation check | Nothing if the retry succeeds (otherwise the run falls back); if it repeats weekly, the chunk job runs into the reconcile — schedule it earlier |
@@ -3681,7 +3686,7 @@ change goes unseen.
 
 ```bash
 kubectl --context cluster-b get cronjob nas-sync-manifest -n ea-pmc
-# The manifest Jobs: the command in "Generator Job Failed" below, filtered with grep nas-sync-manifest
+# The manifest Jobs: the command in "Generator Job Failed" below, filtered with grep -E 'CRONJOB|nas-sync-manifest'
 kubectl --context cluster-b logs job/<latest-manifest-job> -n ea-pmc
 ```
 
@@ -3690,7 +3695,7 @@ Common causes: source NFS mount became read-only, the registry ConfigMap is malf
 Fix the generator, then the next client run proceeds normally. `MANIFEST_MAX_AGE` (default
 86400s) tunes the tolerance; it must be a whole number of seconds. Anything else logs
 `WARN: MANIFEST_MAX_AGE='…' is not a non-negative integer — using 86400` and the default applies
-(before v3.16 a bad value silently turned the guard off).
+(before v3.16 a bad value turned the guard off, or on for ever (`-5`)).
 
 ### Generator Job Failed: `lock '…' held by […]` or `cannot determine the age of lock '…'` (exit 75)
 
@@ -3871,7 +3876,7 @@ cluster-a/
 | Folder names with any character (`--files-from --from0`) | v3.16 | ✓ (§8.11, §8.3) — spaces, CJK, quotes, glob characters |
 | Verify tier 2 sees every folder and reports rsync errors | v3.16 | ✓ (§8.10) — was blind to the same names |
 | Listings and verify do not tolerate rsync rc 23 | v3.16 | ✓ (§8.3, §8.10) — an unreadable folder was missing from the list, or `drift=0` said nothing about it; rc 24 stays tolerated, and so does a folder that vanished before its tier 2 check (§13) |
-| Settings that gate a check are validated | v3.16 | ✓ (§8.10, §4.7, §8.3, §8.4) — `VERIFY_MODE`/`VERIFY_SLICES`/`VERIFY_FAIL_THRESHOLD` fail the run; `LOCK_*`, `CHUNK_MAX_AGE` and `MANIFEST_MAX_AGE` fall back to their defaults with a WARN and are read as decimal; a typo ended in `VERIFY OK`, a lock-free run or a silently disabled stale guard |
+| Settings that gate a check are validated | v3.16 | ✓ (§8.10, §4.7, §8.3, §8.4) — `VERIFY_MODE`/`VERIFY_SLICES`/`VERIFY_FAIL_THRESHOLD` fail the run; `LOCK_*`, `CHUNK_MAX_AGE` and `MANIFEST_MAX_AGE` fall back to their defaults with a WARN and are read as decimal; a typo ended in `VERIFY OK`, a lock-free run, or a stale guard that was off (or, for a negative value, always tripped) |
 | Metadata rsyncs time out (`RSYNC_LIST_TIMEOUT`, default 300s) | v3.16 | ✓ (§8.3, §8.11) — a dead connection hung the chunk fetch or the listing until the Job deadline |
 | Sync machinery never replicated by the fallback | v3.16 | ✓ (§8.11, §8.3) — `.nas-sync-state/` was copied to targets |
 | Top-level pass non-recursive | v3.16 | ✓ (§8.3) — `-a --dirs` was a full serial sync |

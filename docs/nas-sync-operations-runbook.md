@@ -80,7 +80,7 @@ kubectl --context cluster-b get pods -n istio-system
 kubectl --context cluster-b get svc -n istio-system | grep gateway
 
 # 4. Registry reachable from both clusters
-docker pull ${REGISTRY}/<any-existing-image>
+docker pull ${REGISTRY}/ANY_EXISTING_IMAGE_HERE    # ◄ any image you already push to that registry
 ```
 
 **Also decide now** (changing these later is disruptive):
@@ -210,10 +210,12 @@ kubectl --context cluster-a logs -f $POD -n ea-pmc -c nas-sync-client
 2. The log shows `client=nas-a` and `Incremental: N changed files` — **not**
    `FULL sync fallback` (see [S12](#s12--triage-decision-tree)).
 3. `=== COMPLETE: rsync_rc=0 exit=0 ... ===`.
-4. The status file exists:
-   `kubectl exec $POD -n ea-pmc -c nas-sync-client -- cat /mnt/nas-target/.nas-sync-status/last-success`
-5. The shebang check is clean:
-   `kubectl exec $POD -n ea-pmc -c nas-sync-client -- head -1 /userapp/scripts/dispatch-sync.sh | cat -A`
+4. The status file exists. The test Job's pod has finished, so `kubectl exec` into it is
+   refused ("cannot exec into a container in a completed pod"): read the files with the
+   throw-away pod of guide §13, "Is the sync even running?".
+5. The shebang check is clean. Same reason: use a throw-away pod from the image
+   (`${REGISTRY}` as in step 2 of Phase 3):
+   `kubectl --context cluster-a run shebang --rm -it --restart=Never -n ea-pmc --image=${REGISTRY}/nas-sync-client:3.16 --command -- sh -c 'head -1 /userapp/scripts/dispatch-sync.sh | cat -A'`
    → `#!/bin/bash$`. A trailing `^M` means CRLF got in; rebuild.
 
 ```bash
@@ -715,10 +717,13 @@ kubectl --context cluster-a logs -n ea-pmc -l job-name=upgrade-check
 **Post-upgrade checks** (guide §11):
 
 ```bash
-POD=$(kubectl get pods -n ea-pmc -l job-name=upgrade-check -o jsonpath='{.items[0].metadata.name}')
-kubectl exec $POD -n ea-pmc -c nas-sync-client -- head -1 /userapp/scripts/dispatch-sync.sh | cat -A   # #!/bin/bash$
-kubectl exec $POD -n ea-pmc -c nas-sync-client -- ls /userapp/scripts/                                  # new scripts present
-kubectl logs $POD -n ea-pmc -c nas-sync-client | grep -E 'client=|Incremental:|FULL sync fallback'
+POD=$(kubectl --context cluster-a get pods -n ea-pmc -l job-name=upgrade-check -o jsonpath='{.items[0].metadata.name}')
+kubectl --context cluster-a logs $POD -n ea-pmc -c nas-sync-client | grep -E 'client=|Incremental:|FULL sync fallback'
+
+# The upgrade-check Job's pod has finished, and kubectl refuses exec into a completed pod
+# ("cannot exec into a container in a completed pod"), so inspect the new image in a throw-away pod:
+kubectl --context cluster-a run shebang --rm -it --restart=Never -n ea-pmc --image=${REGISTRY}/nas-sync-client:3.16 --command -- sh -c 'head -1 /userapp/scripts/dispatch-sync.sh | cat -A; ls /userapp/scripts/'
+#   expect: #!/bin/bash$, then the client scripts (new ones present)
 ```
 
 **Rollback** is a tag change — no state migration is involved in either direction. The tag is

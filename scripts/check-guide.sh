@@ -7,6 +7,7 @@
 # get copied verbatim into real files at deploy time. Nothing here is built or run,
 # so "tests" mean proving the blocks are valid and the document is internally
 # consistent. Run this before every commit that touches a guide.
+# Runtime behavior (rsync, signals, locks) is covered by scripts/test-guide-behavior.sh.
 #
 # Usage:  scripts/check-guide.sh [guide.md ...]
 #         (defaults to the newest cross-cluster-rsync-guide-v*.md)
@@ -204,6 +205,64 @@ for GUIDE in "${GUIDES[@]}"; do
         fi
         ;;
       *) warn "pre-v3.15 guide — skipping v3.15 regression checks" ;;
+    esac
+
+    # ---------------------------------------------------------------
+    head2 "10. v3.16 defect-fix regressions"
+    # IDs are the findings in docs/superpowers/specs/2026-10-01-v316-review-fixes-design.md §2.
+    check_absent() { if grep -qF -e "$2" -- "$GUIDE"; then fail "$1 — must not appear: $2"; else pass "$1"; fi; }
+    # Text of one guide section: from its "### <sec> File" heading up to the next "### " heading.
+    sec_text() { awk -v s="### $1 File" 'index($0, s) == 1 {f = 1; next} f && /^### / {exit} f' "$GUIDE"; }
+    # No -q: with pipefail an early grep exit could SIGPIPE awk and fail a check that passed.
+    check_in_sec() { if sec_text "$2" | grep -F -e "$3" -- >/dev/null; then pass "$1"; else fail "$1 — expected to find: $3"; fi; }
+    case "$GUIDE" in
+      *v3.1[6-9]*|*v3.[2-9]*)
+        check_has    "F1: chunk files carry their generation"           "generation="
+        check_has    "F1: client retries an inconsistent chunk set"     "CHUNK_RETRY_WAIT"
+        check_has    "F2: manifest generator takes the state-dir lock"  "lock_acquire manifests"
+        check_has    "F2: chunk generator takes the state-dir lock"     "lock_acquire chunks"
+        check_has    "F2: lock library is COPYed into the server image" "COPY nas-sync-state-lock.sh"
+        check_has    "F3/F4: folder names travel via --files-from"      "--from0 --files-from=-"
+        check_has    "F3/F4: one shared top-level lister"               "list_top_dirs"
+        check_has    "F3/F4: library is COPYed into the client image"   "COPY nas-sync-lib.sh"
+        check_has    "F4: the lister's perl is checked at build time"   "command -v perl"
+        check_absent "F4: v3.15 \$NF folder parser is gone"             '$NF != "."'
+        check_has    "F5: top-level pass is non-recursive"              "--no-recursive --dirs"
+        # Every rsync command line with --dirs must be non-recursive: -a implies -r.
+        if grep -E 'rsync .*--dirs' "$GUIDE" | grep -vqF -e '--no-recursive --dirs'; then
+            fail "F5: a recursive '-a --dirs' rsync is back (copies the whole tree serially)"
+        else
+            pass "F5: no recursive '--dirs' rsync"
+        fi
+        # §8.7 also contains this line, so the wrapper check is scoped to §8.6.
+        check_in_sec "F6: wrapper signals its process group"            8.6 "kill -TERM 0 2>/dev/null"
+        check_has    "F6: dispatcher waits for the mode script"         'wait_child "$CHILD"'
+        check_has    "F6: entrypoint waits for cron and its runs"       'wait_child "$CRON_PID"'
+        # A command line, not prose: comments may explain why it is gone.
+        if grep -qE '^[[:space:]]*exec cron' "$GUIDE"; then
+            fail "F6: the Deployment entrypoint execs cron again (cron-launched runs lose SIGTERM)"
+        else
+            pass "F6: entrypoint does not exec cron"
+        fi
+        GRACE=$(grep -c 'terminationGracePeriodSeconds: 60' "$GUIDE")
+        if [ "$GRACE" -ge 4 ]; then pass "F6: grace period on all $GRACE client pod specs"; else fail "F6: terminationGracePeriodSeconds: 60 on $GRACE pod spec(s), expected 4 (§9A.2, §9A.4, §9A.5, §10B.1)"; fi
+        # §8.7 shutdown fixes (code lines, not comments) that only the slow runtime suite covers otherwise.
+        check_in_sec "F6: §8.7 a TERM at launch still signals the initial sync" 8.7 '[ -n "$GOT_TERM" ] && kill -TERM 0 2>/dev/null'
+        check_in_sec "F6: §8.7 a TERM at launch still stops cron"        8.7 '[ -n "$GOT_TERM" ] && kill -TERM "$CRON_PID"'
+        check_in_sec "F6: §8.7 drain signals each run group once (a repeat TERM loses the partial)" 8.7 'case "$SIGNALLED" in'
+        # A launch guarded by a drain on the previous code line (comments and blanks skipped): a TERM before
+        # the launch must not start an unbounded sync or cron. The post-wait drains do not count.
+        PRELAUNCH=$(sec_text 8.7 | awk '/^[[:space:]]*(#|$)/ {next}
+            /^[[:space:]]*(flock -n|cron -f)/ && prev ~ /^[[:space:]]*\[ -n "\$GOT_TERM" \] && drain_and_exit/ {n++}
+            {prev = $0} END {print n + 0}')
+        if [ "$PRELAUNCH" -ge 2 ]; then
+            pass "F6: §8.7 no launch after a TERM (initial sync and cron guarded)"
+        else
+            fail "F6: §8.7 pre-launch drain_and_exit guards $PRELAUNCH of 2 launches (initial sync, cron) — a TERM before launch starts a sync nobody signals"
+        fi
+        check_has    "F7: status records interruptions"                 "interrupted=TERM"
+        ;;
+      *) warn "pre-v3.16 guide — skipping v3.16 regression checks" ;;
     esac
 done
 

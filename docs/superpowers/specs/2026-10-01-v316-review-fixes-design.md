@@ -244,9 +244,13 @@ Either failing is a run failure. This catches xargs stopping partway (F4c).
   equal the NUL count of the list file (which must be non-zero), and the dirs checked must equal the slice size —
   any mismatch is a `die`.
 - **rc handling:**
-  - Any rc outside {0, 23, 24} fails the run, printing the first lines of stderr.
-  - rc 23 is logged as a WARN with the first stderr line; it usually means the directory was removed between
-    listing and checking.
+  - Any rc outside {0, 24} fails the run, printing the first lines of stderr; this holds for tier 1 and for each
+    per-directory check. rc 24 (an entry vanished mid-scan) is a success.
+  - rc 23 fails the run too (exit 23): a directory that exists could not be read, so nothing in it was compared
+    and drift=0 would be false assurance. The one exception is the per-directory check, when stderr holds nothing
+    but the `link_stat … No such file or directory` error (plus rsync's own `rsync error:` line and, from the
+    daemon, `[Receiver] read error: Connection reset`): the folder was removed after the listing, which is a WARN,
+    and the folder is skipped.
 
 ## 6. Design C — Signals and status (F6, F7)
 
@@ -302,7 +306,7 @@ depends on it, as the matrix below shows.
 | Lock held by a live run | `exit 75`, nothing written | Job Failed + `lock … held by …` |
 | Stale lock (no heartbeat for 10 min) | broken atomically, run proceeds | WARN line |
 | xargs aborted, or rc-file count ≠ units | run fails | `exit 1` + reason |
-| verify rsync rc ∉ {0, 23, 24} | verify fails | `exit` with rc + first stderr lines |
+| verify rsync rc ∉ {0, 24}, rc 23 included (tier 2 exception: the folder vanished after the listing) | verify fails | `exit` with rc + first stderr lines |
 | SIGTERM (any path) | rsync stops cleanly, partial kept, status written | `last-run … exit=143 interrupted=TERM` |
 | Cron run still busy at `SHUTDOWN_WAIT` | WARN, then exit; kubelet SIGKILLs at the grace limit | WARN line |
 

@@ -331,6 +331,104 @@ if want names; then
     check "verify tier 2: a top-level listing that ends rc 23 fails (exit 23), it does not report drift=0 / VERIFY OK (rc=$RC)" \
         '[ "$RC" -eq 23 ] && grep -q "Tier 2: cannot list top-level dirs (rsync rc=23)" "$T/verify-rc23.log" && ! grep -q "VERIFY OK" "$T/verify-rc23.log"'
 
+    # An unreadable source DIRECTORY is rc 23 too ("opendir ... Permission denied"; an I/O error looks the same). Nothing
+    # inside it is listed, compared or counted, so a verify that tolerated rc 23 said drift=0 / VERIFY OK over a tree it
+    # had not read: in silence in tier 1, with a misleading WARN in tier 2. The suite's daemon runs as root and reads
+    # everything, so a second daemon runs as `nobody` over a tree with a root-owned mode-700 directory, which is the rc 23
+    # a daemon gives under NFS root_squash. No shim: the error comes from rsync itself.
+    NB_UID=$(id -u nobody 2>/dev/null); NB_GID=$(id -g nobody 2>/dev/null)
+    if [ -z "$NB_UID" ] || [ -z "$NB_GID" ]; then
+        skip "verify, unreadable source directory (tier 1 and 2): no user 'nobody' to run the second daemon as"
+    else
+        mkdir -p "$T/src-nb/ok" "$T/src-nb/locked"
+        echo okdata > "$T/src-nb/ok/a.txt"; echo SECRET > "$T/src-nb/locked/secret.txt"; echo top > "$T/src-nb/top.txt"
+        chmod 755 "$T/src-nb" "$T/src-nb/ok"          # explicit modes: nothing may depend on the caller's umask
+        chmod 644 "$T/src-nb/top.txt" "$T/src-nb/ok/a.txt" "$T/src-nb/locked/secret.txt"
+        cat > "$T/rsyncd-nb.conf" <<EOF
+uid = $NB_UID
+gid = $NB_GID
+use chroot = no
+reverse lookup = no
+pid file = $T/rsyncd-nb.pid
+log file = $T/rsyncd-nb.log
+[nas-data]
+    path = $T/src-nb
+    read only = yes
+    list = yes
+    auth users = syncuser
+    secrets file = $T/rsyncd.secrets
+EOF
+        NBPORT=$(free_port 19000 19090)
+        "$REAL_RSYNC" --daemon --no-detach --config="$T/rsyncd-nb.conf" --port="$NBPORT" --address=127.0.0.1 & NBPID=$!; bg_add "$NBPID"
+        for _ in $(seq 1 50); do nc -z 127.0.0.1 "$NBPORT" 2>/dev/null && break; sleep 0.1; done
+        DSTN=$(fresh_dst names-nb)
+        "$REAL_RSYNC" -a "$T/src-nb/" "$DSTN/"
+        vnb() {  # vnb <VERIFY_MODE> <logfile>: verify the tree $DSTN against the daemon that runs as nobody
+            REMOTE_PORT="$NBPORT" LOCAL_NAS_PATH="$DSTN" VERIFY_MODE="$1" VERIFY_SLICES=1 timeout --kill-after=10 300 "$S/nas-sync-verify.sh" > "$2" 2>&1
+        }
+        # Controls: everything readable. The setup must show a clean tree as clean and a missing file as drift, or the
+        # failures below would not prove anything about the unreadable directory.
+        chmod 755 "$T/src-nb/locked"
+        vnb meta "$T/nb-c1m.log"; RC1=$?; vnb checksum "$T/nb-c1c.log"; RC2=$?
+        check "control (daemon as nobody, all readable, tree in sync): verify tier 1 and tier 2 exit 0, drift=0 (rc=$RC1/$RC2)" \
+            '[ "$RC1" -eq 0 ] && [ "$RC2" -eq 0 ] && grep -q "VERIFY RESULT .* drift=0 " "$T/nb-c1m.log" && grep -q "VERIFY RESULT .* drift=0 " "$T/nb-c1c.log"'
+        rm -f "$DSTN/locked/secret.txt"            # real drift, inside the directory that is about to become unreadable
+        vnb meta "$T/nb-c2m.log"; RC1=$?; vnb checksum "$T/nb-c2c.log"; RC2=$?
+        check "control (all readable): the file missing in 'locked' is drift=1 in tier 1 and in tier 2 (exit 1/1, rc=$RC1/$RC2)" \
+            '[ "$RC1" -eq 1 ] && [ "$RC2" -eq 1 ] && grep -q "VERIFY RESULT .* drift=1 " "$T/nb-c2m.log" && grep -q "VERIFY RESULT .* drift=1 " "$T/nb-c2c.log"'
+        chmod 700 "$T/src-nb/locked"               # root-owned, mode 700: the daemon (nobody) cannot read it
+        vnb meta "$T/nb-m.log"; RCM=$?
+        check "verify tier 1: a source directory the daemon cannot read fails the run (exit 23), no drift=0 / VERIFY OK (rc=$RCM)" \
+            '[ "$RCM" -eq 23 ] && grep -q "rsync failed during metadata verify (rc=23)" "$T/nb-m.log" && grep -q "opendir \"locked\"" "$T/nb-m.log" && ! grep -q "VERIFY OK" "$T/nb-m.log" && ! grep -q "VERIFY RESULT" "$T/nb-m.log"'
+        vnb checksum "$T/nb-c.log"; RCC=$?
+        check "verify tier 2: a source directory the daemon cannot read fails the run (exit 23) and names the folder (rc=$RCC)" \
+            '[ "$RCC" -eq 23 ] && grep -q "rc=23 checking locked: part of it could not be read" "$T/nb-c.log" && grep -q "opendir \"locked\"" "$T/nb-c.log" && ! grep -q "VERIFY OK" "$T/nb-c.log" && ! grep -q "VERIFY RESULT" "$T/nb-c.log"'
+        bg_stop "$NBPID"
+    fi
+
+    # The benign rc 23 stays tolerated: a folder that VANISHES between the listing and its check. rsync then reports only
+    # `link_stat "<d>" ... No such file or directory`. The shim removes the folder right after the --list-only run (a real
+    # removal, so the check really finds nothing). "removed between listing and checking" is in the WARN of both the
+    # old and the new text, so this check is green on either and only guards against a regression.
+    mkdir -p "$T/shim-vanish"
+    printf '#!/bin/bash\ncase " $* " in *" --list-only "*) %s "$@"; rc=$?; rm -rf "%s/src/vanishing"; exit "$rc";; esac\nexec %s "$@"\n' \
+        "$REAL_RSYNC" "$T" "$REAL_RSYNC" > "$T/shim-vanish/rsync"
+    chmod +x "$T/shim-vanish/rsync"
+    DST6=$(fresh_dst names-vanish)
+    mkdir -p "$T/src/vanishing"; echo v > "$T/src/vanishing/f.txt"
+    "$REAL_RSYNC" -a "$T/src/" "$DST6/"
+    PATH="$T/shim-vanish:$PATH" LOCAL_NAS_PATH="$DST6" VERIFY_MODE=checksum VERIFY_SLICES=1 timeout --kill-after=10 300 "$S/nas-sync-verify.sh" > "$T/verify-vanish.log" 2>&1
+    RC=$?
+    check "verify tier 2: a folder that vanishes between the listing and its check is tolerated (WARN, exit 0, drift=0) (rc=$RC)" \
+        '[ "$RC" -eq 0 ] && [ ! -e "$T/src/vanishing" ] && grep -q "removed between listing and checking" "$T/verify-vanish.log" && grep -q "VERIFY RESULT .* drift=0 " "$T/verify-vanish.log"'
+    # ... and real drift in another folder is still counted exactly once: the rsync error text goes to a separate file
+    # and is never counted as drift.
+    mkdir -p "$T/src/vanishing"; echo v > "$T/src/vanishing/f.txt"
+    f="$DST6/normal/f.txt"; t=$(stat -c %Y "$f"); sz=$(stat -c %s "$f")
+    head -c "$sz" /dev/zero | tr '\0' 'Z' > "$f"; touch -d "@$t" "$f"
+    PATH="$T/shim-vanish:$PATH" LOCAL_NAS_PATH="$DST6" VERIFY_MODE=checksum VERIFY_SLICES=1 timeout --kill-after=10 300 "$S/nas-sync-verify.sh" > "$T/verify-vanish2.log" 2>&1
+    RC=$?
+    check "verify tier 2: with a vanished folder, real drift elsewhere is counted exactly (exit 1, drift=1, rc=$RC)" \
+        '[ "$RC" -eq 1 ] && [ ! -e "$T/src/vanishing" ] && grep -q "VERIFY RESULT .* drift=1 " "$T/verify-vanish2.log" && ! grep -q "verify aborted" "$T/verify-vanish2.log"'
+
+    # VERIFY_SLICES with a leading zero: $(( )) reads 08 as an arithmetic error that skipped tier 2 altogether and still
+    # ended in VERIFY OK, and 010 as octal 8. A non-number (or 0) was the same silent skip. DST8 is in sync.
+    DST8=$(fresh_dst names-slices)
+    "$REAL_RSYNC" -a "$T/src/" "$DST8/"
+    for sl in 08 010; do
+        want=$((10#$sl))
+        LOCAL_NAS_PATH="$DST8" VERIFY_MODE=checksum VERIFY_SLICES="$sl" timeout --kill-after=10 300 "$S/nas-sync-verify.sh" > "$T/verify-slices-$sl.log" 2>&1
+        RC=$?
+        check "VERIFY_SLICES=$sl (leading zero) is decimal $want: tier 2 runs as 'slice N of $want', no arithmetic error, exit 0 (rc=$RC)" \
+            '[ "$RC" -eq 0 ] && grep -Eq "Tier 2: checksum verify, slice [0-9]+ of $want \(week" "$T/verify-slices-$sl.log" && grep -q "Tier 2: drift=0 of" "$T/verify-slices-$sl.log" && ! grep -qiE "too great|arithmetic|syntax error" "$T/verify-slices-$sl.log"'
+    done
+    for sl in abc 0; do
+        LOCAL_NAS_PATH="$DST8" VERIFY_MODE=checksum VERIFY_SLICES="$sl" timeout --kill-after=10 300 "$S/nas-sync-verify.sh" > "$T/verify-slices-$sl.log" 2>&1
+        RC=$?
+        check "VERIFY_SLICES=$sl: verify fails with 'not a positive integer' instead of skipping tier 2 and saying VERIFY OK (rc=$RC)" \
+            '[ "$RC" -ne 0 ] && grep -q "VERIFY_SLICES=.$sl. is not a positive integer" "$T/verify-slices-$sl.log" && ! grep -q "VERIFY OK" "$T/verify-slices-$sl.log"'
+    done
+
     # A daemon that accepts the connection and never answers: the chunk-list fetch and the top-level listing
     # must give up after RSYNC_LIST_TIMEOUT (rsync --timeout) instead of hanging until the Job deadline.
     cat > "$T/blackhole.pl" <<'PEOF'
@@ -535,13 +633,13 @@ if want lock; then
     # although 120/60 is valid. LOCK_STALE=08 (HEARTBEAT 60) is inconsistent: WARN and defaults, the 3 s-old lock holds.
     mklock 3 3
     LOCK_STALE=08 timeout --kill-after=10 300 "$S/generate-chunks.sh" > "$T/octal8.log" 2>&1; RC=$?
-    check "LOCK_STALE=08 (leading zero): read as decimal 8 < 2 x 60: WARN, defaults used, no arithmetic error, a 3 s-old lock holds (exit 75) [rc=$RC]" \
-        '[ "$RC" -eq 75 ] && grep -q "must be at least 2 x LOCK_HEARTBEAT" "$T/octal8.log" && ! grep -qiE "too great|syntax error|arithmetic" "$T/octal8.log" && grep -qx "run_id=live-holder" "$LOCKD/owner" 2>/dev/null'
+    check "LOCK_STALE=08 (leading zero): read as decimal 8 < 2 x 60: WARN says LOCK_STALE=8, defaults used, no arithmetic error, a 3 s-old lock holds (exit 75) [rc=$RC]" \
+        '[ "$RC" -eq 75 ] && grep -q "LOCK_STALE=8 must be at least 2 x LOCK_HEARTBEAT" "$T/octal8.log" && ! grep -qiE "too great|syntax error|arithmetic" "$T/octal8.log" && grep -qx "run_id=live-holder" "$LOCKD/owner" 2>/dev/null'
     # LOCK_STALE=0120 (HEARTBEAT 60) is valid: no WARN, and 120 is the threshold in force: a 130 s-old lock is broken.
     mklock 130 130
     LOCK_STALE=0120 timeout --kill-after=10 300 "$S/generate-chunks.sh" > "$T/octal120.log" 2>&1; RC=$?
-    check "LOCK_STALE=0120 (leading zero): read as decimal 120, no WARN, a 130 s-old lock is broken as stale > 120 s [rc=$RC]" \
-        '[ "$RC" -eq 0 ] && ! grep -q "must be at least" "$T/octal120.log" && grep -Eq "heartbeat 13[0-9]s ago > 0*120s" "$T/octal120.log"'
+    check "LOCK_STALE=0120 (leading zero): read as decimal 120, no WARN, a 130 s-old lock is broken as stale > 120s (logged as 120s, not 0120s) [rc=$RC]" \
+        '[ "$RC" -eq 0 ] && ! grep -q "must be at least" "$T/octal120.log" && grep -Eq "heartbeat 13[0-9]s ago > 120s" "$T/octal120.log"'
     rm -rf "$LOCKD"
     # M5: lock_release left the heartbeat's sleep running, and it held the job's stdout for up to LOCK_HEARTBEAT
     # seconds: `generate-... | tee` stalled after the job had finished. With LOCK_HEARTBEAT=10 the pipeline must
@@ -588,6 +686,62 @@ if want lock; then
     STRANDED=$(ls -A "$M1S/locks" | grep -c '\.lock\.stale\.')
     check "a lock displaced by mistake is not stranded as *.lock.stale.* when a third run takes the name (exit 75, stranded=$STRANDED) [rc=$RC]" \
         '[ "$RC" -eq 75 ] && [ "$STRANDED" -eq 0 ] && grep -q "could not restore.*displaced copy was removed" "$T/m1race.log"'
+    # N2: the restore fails and NOTHING holds the name (the hook's `mv -T` fails): the displaced lock is kept as
+    # job.lock.stale.<run>. It must not stay for ever. The next run that takes the lock removes it once its heartbeat is
+    # older than LOCK_STALE (a displaced lock gets no more heartbeats), and never earlier, never the live lock, never a
+    # dir of another name.
+    N2S="$T/n2state"; rm -rf "$N2S"; mkdir -p "$N2S/locks/job.lock"
+    printf 'run_id=dead-pod\n' > "$N2S/locks/job.lock/owner"
+    "$REAL_TOUCH" -d "@$(( $(date +%s) - 1200 ))" "$N2S/locks/job.lock/owner" "$N2S/locks/job.lock"
+    bash -c '
+        . "$1"; STATE_DIR="$2"; log() { echo "$1"; }
+        mv() {
+            case "$1" in
+                -T) return 1 ;;
+                *)  rm -rf "$LOCK_PATH"; mkdir "$LOCK_PATH"; printf "run_id=X\n" > "$LOCK_PATH/owner"; touch "$LOCK_PATH/heartbeat" ;;
+            esac
+            command mv "$@"
+        }
+        lock_acquire job' _ "$S/nas-sync-state-lock.sh" "$N2S" > "$T/n2kept.log" 2>&1; RC=$?
+    KEPT=$(ls -d "$N2S"/locks/job.lock.stale.* 2>/dev/null | head -n 1)
+    check "restore failed, nothing holds the name: exit 75, the displaced lock is kept as job.lock.stale.* [rc=$RC]" \
+        '[ "$RC" -eq 75 ] && [ -d "$KEPT" ] && grep -q "nothing holds the name.*kept as" "$T/n2kept.log"'
+    n2run() {  # n2run <logfile>: a normal run that takes the lock; LOCK-INTACT = the live lock dir is still ours afterwards
+        LOCK_HEARTBEAT=1 bash -c '. "$1"; STATE_DIR="$2"; log() { echo "$1"; }
+            lock_acquire job; [ -d "$LOCK_PATH" ] && grep -qx "run_id=$LOCK_RUN_ID" "$LOCK_PATH/owner" && echo LOCK-INTACT' \
+            _ "$S/nas-sync-state-lock.sh" "$N2S" > "$1" 2>&1
+    }
+    mkdir -p "$N2S/locks/jobx.lock.stale.zzz" "$N2S/locks/other.lock.stale.zzz"      # other names: never this job's business
+    "$REAL_TOUCH" -d "@$(( $(date +%s) - 1200 ))" "$N2S"/locks/jobx.lock.stale.zzz "$N2S"/locks/other.lock.stale.zzz
+    n2run "$T/n2run1.log"; RC=$?
+    check "a displaced lock younger than LOCK_STALE is left alone by the next run, which takes the lock normally [rc=$RC]" \
+        '[ "$RC" -eq 0 ] && [ -d "$KEPT" ] && grep -q LOCK-INTACT "$T/n2run1.log" && ! grep -q "Removed the leftover" "$T/n2run1.log"'
+    "$REAL_TOUCH" -d "@$(( $(date +%s) - 1200 ))" "$KEPT/heartbeat" "$KEPT"           # 20 minutes without a heartbeat
+    n2run "$T/n2run2.log"; RC=$?
+    check "the next run that takes the lock removes the displaced lock once it is older than LOCK_STALE, and keeps its own lock [rc=$RC]" \
+        '[ "$RC" -eq 0 ] && [ ! -d "$KEPT" ] && grep -q "Removed the leftover displaced lock" "$T/n2run2.log" && grep -q LOCK-INTACT "$T/n2run2.log"'
+    check "the sweep is scoped to the lock name: jobx.lock.stale.* and other.lock.stale.* are untouched" \
+        '[ -d "$N2S/locks/jobx.lock.stale.zzz" ] && [ -d "$N2S/locks/other.lock.stale.zzz" ]'
+
+    # N3: a registry lookback with a leading zero. $(( )) reads 08 as an arithmetic error that abandons the whole registry
+    # loop (no client at all, rc 1: even the valid ones lose their manifest) and 010 as octal 8. window = generated_at -
+    # window_threshold_epoch in manifest.meta, in hours, must be the decimal value. A bad value (1x) is skipped with a WARN.
+    win() { awk -F= '/^generated_at=/{g=$2} /^window_threshold_epoch=/{w=$2} END{if (g != "" && w != "") print (g - w) / 3600}' "$1" 2>/dev/null; }
+    RG="$T/regstate"; rm -rf "$RG"
+    printf '# comment\ncl08 08\ncl24 24\nclbad 1x\n' > "$T/clients-oct1.txt"
+    LOCK_HEARTBEAT=1 STATE_DIR="$RG" REGISTRY_FILE="$T/clients-oct1.txt" timeout --kill-after=10 300 "$S/generate-manifests.sh" > "$T/oct1.log" 2>&1; RC=$?
+    W08=$(win "$RG/clients/cl08/manifest.meta"); W24=$(win "$RG/clients/cl24/manifest.meta")
+    check "registry lookback 08 (leading zero) is 8 hours and does not abandon the registry: cl24 is still served (rc=$RC, window cl08=${W08:-none}h cl24=${W24:-none}h)" \
+        '[ "$RC" -eq 0 ] && [ "$W08" = 8 ] && [ "$W24" = 24 ] && grep -q "client=cl08 lookback=8h" "$T/oct1.log" && ! grep -qiE "too great|arithmetic" "$T/oct1.log"'
+    check "registry lookback 1x is skipped with a WARN, the other clients are served" \
+        'grep -q "WARN: bad lookback for .clbad. (.1x.)" "$T/oct1.log" && [ ! -d "$RG/clients/clbad" ] && [ -s "$RG/clients/cl24/manifest.meta" ]'
+    rm -rf "$RG"
+    printf 'cl010 010\ncl24 24\n' > "$T/clients-oct2.txt"
+    LOCK_HEARTBEAT=1 STATE_DIR="$RG" REGISTRY_FILE="$T/clients-oct2.txt" timeout --kill-after=10 300 "$S/generate-manifests.sh" > "$T/oct2.log" 2>&1; RC=$?
+    W010=$(win "$RG/clients/cl010/manifest.meta")
+    check "registry lookback 010 means 10 hours, not octal 8 (rc=$RC, window=${W010:-none}h)" \
+        '[ "$RC" -eq 0 ] && [ "$W010" = 10 ] && grep -q "client=cl010 lookback=10h" "$T/oct2.log"'
+    rm -rf "$RG"
     unset SOURCE_PATH STATE_DIR REGISTRY_FILE CHUNK_COUNT
 fi
 

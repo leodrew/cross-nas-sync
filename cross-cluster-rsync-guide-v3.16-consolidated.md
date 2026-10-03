@@ -286,6 +286,9 @@ CLIENT_IDS=(); THRESHOLDS=()
 while read -r CID HOURS _rest; do
     case "$CID" in ''|\#*) continue;; esac
     case "$HOURS" in ''|*[!0-9]*) log "WARN: bad lookback for '$CID' ('$HOURS') — skipping"; continue;; esac
+    # 10#: $(( )) reads a leading zero as octal. A plain 08 is an arithmetic error that abandons
+    # this whole loop (every client after it is lost), and 010 would silently mean 8 hours.
+    HOURS=$((10#$HOURS))
     THRESH=$(( NOW - HOURS * 3600 ))
     mkdir -p "${CLIENTS_DIR}/${CID}"
     : > "${CLIENTS_DIR}/${CID}/sync-manifest.txt.tmp.${RUN_ID}"
@@ -637,6 +640,22 @@ _lock_age() {
     echo $(( now - hb ))
 }
 
+# _lock_sweep <name>: remove a displaced lock that could not go back (<name>.lock.stale.<run>: the
+# restore in lock_acquire failed with nothing holding the name, or a run was killed between the
+# rename and the rm). Called with the lock held. A displaced lock gets no more heartbeats (its
+# holder touches <name>.lock/heartbeat, which is gone), so a dir whose heartbeat is older than
+# LOCK_STALE has no live run behind it: the test that breaks a lock. A younger dir is left alone,
+# and so is one whose age cannot be read. <name>.lock itself never matches the pattern.
+_lock_sweep() {
+    local d age
+    for d in "${STATE_DIR}/locks/${1}.lock.stale."*; do
+        [ -d "$d" ] || continue
+        age=$(_lock_age "$d") || continue
+        [ "$age" -gt "$LOCK_STALE" ] || continue
+        rm -rf "$d" && log "Removed the leftover displaced lock '${d}' (heartbeat ${age}s old)"
+    done
+}
+
 lock_release() {
     [ -n "$LOCK_HB_PID" ] && kill "$LOCK_HB_PID" 2>/dev/null
     [ -n "$LOCK_PATH" ] || return 0
@@ -652,11 +671,13 @@ lock_acquire() {
     # A bad LOCK_* value must not turn into a failed test that reads as "not stale".
     _lock_posint "$LOCK_HEARTBEAT" || { log "WARN: LOCK_HEARTBEAT='${LOCK_HEARTBEAT}' is not a positive integer — using 60"; LOCK_HEARTBEAT=60; }
     _lock_posint "$LOCK_STALE"     || { log "WARN: LOCK_STALE='${LOCK_STALE}' is not a positive integer — using 600"; LOCK_STALE=600; }
+    # Decimal from here on: $(( )) reads a leading zero as octal, so a plain LOCK_STALE=08 is an
+    # arithmetic error that abandons lock_acquire and lets the job run WITHOUT the lock, and 0120
+    # would be read as 80. (`[` already reads both as decimal; this also makes the log say 120s.)
+    LOCK_HEARTBEAT=$((10#$LOCK_HEARTBEAT)); LOCK_STALE=$((10#$LOCK_STALE))
     # A live holder's heartbeat is up to LOCK_HEARTBEAT old, so LOCK_STALE below 2 x LOCK_HEARTBEAT
     # lets a contender break a live lock. (LOCK_STALE/2 rather than 2*LOCK_HEARTBEAT: no overflow.)
-    # 10#: $(( )) reads a leading zero as octal, so a plain LOCK_STALE=08 is an arithmetic error that
-    # abandons lock_acquire and lets the job run WITHOUT the lock, and 0120 would be read as 80.
-    if [ $(( 10#$LOCK_STALE / 2 )) -lt "$LOCK_HEARTBEAT" ]; then
+    if [ $(( LOCK_STALE / 2 )) -lt "$LOCK_HEARTBEAT" ]; then
         log "WARN: LOCK_STALE=${LOCK_STALE} must be at least 2 x LOCK_HEARTBEAT=${LOCK_HEARTBEAT} — using 600 and 60"
         LOCK_STALE=600; LOCK_HEARTBEAT=60
     fi
@@ -679,6 +700,7 @@ lock_acquire() {
             LOCK_HB_PID=$!
             trap lock_release EXIT
             log "Lock '${name}' acquired (run_id=${LOCK_RUN_ID})"
+            _lock_sweep "$name"
             return 0
         fi
         if [ ! -d "$LOCK_PATH" ]; then
@@ -705,14 +727,15 @@ lock_acquire() {
         if [ "$(cat "${stale_dir}/owner" 2>/dev/null)" != "$owner" ]; then
             # We moved a FRESH lock that another run took after breaking the stale one: put it back.
             if ! mv -T "$stale_dir" "$LOCK_PATH" 2>/dev/null; then
-                # A third run took the name meanwhile, so the lock cannot go back. Remove it rather than
-                # strand it as a *.lock.stale.* dir that no run ever cleans up. (If nothing holds the name
-                # the restore failed for another reason: keep the dir for inspection.)
+                # A third run took the name meanwhile, so the lock cannot go back. Remove it rather
+                # than leave a *.lock.stale.* dir behind. (If nothing holds the name, the restore
+                # failed for another reason: keep the dir for inspection. _lock_sweep removes it
+                # once it is older than LOCK_STALE, at the next run that takes the lock.)
                 if [ -d "$LOCK_PATH" ]; then
                     rm -rf "$stale_dir"
                     log "WARN: could not restore lock '${name}' moved by mistake: another run holds the name, so the displaced copy was removed"
                 else
-                    log "WARN: could not restore lock '${name}' moved by mistake and nothing holds the name: the displaced copy is kept as ${stale_dir}"
+                    log "WARN: could not restore lock '${name}' moved by mistake and nothing holds the name: the displaced copy is kept as ${stale_dir} (a later run removes it once it is older than ${LOCK_STALE}s)"
                 fi
             fi
             log "ERROR: another run broke lock '${name}' first; this run did nothing"
@@ -1522,10 +1545,11 @@ else
     list_top_dirs > "$NAMES_BIN"
     LIST_RC=$?
     check_term
-    # Only rc 0 and 24 are accepted. rc 24 (an entry vanished during the listing) is normal on a live
-    # source and safe here: that entry no longer exists, so no folder is missed. rc 23 is NOT: an entry
-    # that still exists could not be read, so it is missing from the list and no worker would ever sync
-    # it. So not rsync_rc_ok (it maps 23 to success, right for the transfers, wrong for a list).
+    # Only rc 0 and 24 are accepted. rc 24 (an entry vanished during the listing) is normal on a
+    # live source and safe here: that entry no longer exists, so no folder is missed. rc 23 is NOT:
+    # an entry that still exists could not be read, so it is missing from the list and no worker
+    # would ever sync it. So not rsync_rc_ok (it maps 23 to success, right for the transfers,
+    # wrong for a list).
     case "$LIST_RC" in
         0|24) ;;
         *)    die "Cannot list top-level folders (rsync rc=$LIST_RC)" ;;
@@ -1925,7 +1949,8 @@ fi
 # The sync is over: from here a TERM must not re-enter on_term, whose group `kill -TERM 0` would
 # also hit the curl/nc/pilot-agent below. The pod is being deleted anyway, so just end, with the
 # sync's own status: the default action would report a finished, successful sync as 143 (a Failed
-# pod). The trap runs when the foreground curl/nc returns (at once under `tini -g`: it got the TERM too).
+# pod). The trap runs when the foreground curl/nc returns (at once under `tini -g`: it got the
+# TERM too).
 trap 'exit "$SYNC_EXIT"' TERM INT
 
 if [ "$SIDECAR_QUIT_ENABLED" != "true" ]; then
@@ -2324,7 +2349,10 @@ if [ "$VERIFY_MODE" = "meta" ] || [ "$VERIFY_MODE" = "both" ]; then
     rsync $BASE_FLAGS "${REMOTE_URL}/" "${LOCAL_NAS_PATH}/" > "${WORK_DIR}/meta.out" 2>"${WORK_DIR}/meta.err"
     RC=$?
     check_term
-    if [ "$RC" -ne 0 ] && [ "$RC" -ne 24 ] && [ "$RC" -ne 23 ]; then
+    # rc 24 (an entry vanished mid-scan) is normal on a live source. rc 23 is not: a directory
+    # that exists could not be read, so nothing in it was compared and drift=0 would say nothing
+    # about it.
+    if [ "$RC" -ne 0 ] && [ "$RC" -ne 24 ]; then
         log_error "rsync failed during metadata verify (rc=$RC)"
         sed -n '1,20p' "${WORK_DIR}/meta.err" >&2
         die "verify aborted" "$RC"
@@ -2339,6 +2367,12 @@ fi
 
 # ---- Tier 2: checksum verify over a deterministic rotating slice ----
 if [ "$VERIFY_MODE" = "checksum" ] || [ "$VERIFY_MODE" = "both" ]; then
+    # A positive integer, read as decimal: $(( )) below reads a leading zero as octal, so a plain
+    # VERIFY_SLICES=08 was an arithmetic error that skipped this whole tier and still ended in
+    # "VERIFY OK", and 010 meant 8. Anything else (abc, 0) was the same silent skip.
+    case "$VERIFY_SLICES" in ''|*[!0-9]*) die "VERIFY_SLICES='${VERIFY_SLICES}' is not a positive integer" ;; esac
+    [ "$VERIFY_SLICES" -ge 1 ] 2>/dev/null || die "VERIFY_SLICES='${VERIFY_SLICES}' is not a positive integer"
+    VERIFY_SLICES=$((10#$VERIFY_SLICES))
     WEEK=$(date +%V); WEEK=$((10#$WEEK))
     SLICE=$(( WEEK % VERIFY_SLICES ))
     log "Tier 2: checksum verify, slice $SLICE of $VERIFY_SLICES (week $WEEK)..."
@@ -2348,8 +2382,8 @@ if [ "$VERIFY_MODE" = "checksum" ] || [ "$VERIFY_MODE" = "both" ]; then
     list_top_dirs > "${WORK_DIR}/topdirs.bin"
     LIST_RC=$?
     check_term
-    # Only rc 0 and 24 are accepted. rc 24 (an entry vanished) is normal on a live source and safe: it
-    # no longer exists. rc 23 is not: an unreadable entry would be missing from the list, so that
+    # Only rc 0 and 24 are accepted. rc 24 (an entry vanished) is normal on a live source and safe:
+    # it no longer exists. rc 23 is not: an unreadable entry would be missing from the list, so that
     # folder would never be byte-checked and the run could report drift=0 over a short list.
     case "$LIST_RC" in
         0|24) ;;
@@ -2388,7 +2422,21 @@ if [ "$VERIFY_MODE" = "checksum" ] || [ "$VERIFY_MODE" = "both" ]; then
         check_term
         case "$RC" in
             0|24) ;;
-            23)   log "WARN: rc=23 checking $(printf '%q' "$d") (usually: removed between listing and checking): $(head -1 "${WORK_DIR}/ck.err")" ;;
+            23)   # Benign only when the folder itself was removed after the listing: rsync then
+                  # reports nothing but  link_stat "<d>" ... failed: No such file or directory
+                  # (plus its own "rsync error:" line and, from the daemon, a "[Receiver] read
+                  # error: Connection reset" line). Any other rc 23 (opendir or readlink failed:
+                  # permission denied, I/O error) means part of the folder was NOT compared, and
+                  # drift=0 would be false assurance.
+                  if grep -v -e '^rsync error: ' \
+                             -e 'link_stat .* failed: No such file or directory' \
+                             -e 'Receiver\] read error: Connection reset' \
+                             "${WORK_DIR}/ck.err" | grep -q .; then
+                      log_error "rc=23 checking $(printf '%q' "$d"): part of it could not be read, so it was not byte-checked"
+                      sed -n '1,20p' "${WORK_DIR}/ck.err" >&2
+                      die "verify aborted" 23
+                  fi
+                  log "WARN: $(printf '%q' "$d") was removed between listing and checking — skipped" ;;
             *)    log_error "rsync failed checking $(printf '%q' "$d") (rc=$RC)"
                   sed -n '1,20p' "${WORK_DIR}/ck.err" >&2
                   die "verify aborted" "$RC" ;;
@@ -3485,6 +3533,12 @@ kubectl logs -n ea-pmc -l role=verify --tail=300 | grep -E 'VERIFY RESULT|^(>|c)
    writes. Check `last-run` vs `last-success` (below).
 4. **Expected small baseline?** Set `VERIFY_FAIL_THRESHOLD` to just above it rather than
    ignoring failures — an ignored red job is the same as no monitoring.
+
+A verify Job that fails with **exit 23** and no `VERIFY RESULT` line is not drift: rsync could not
+read part of the source (`opendir … Permission denied`, an I/O error), so that part was not
+compared and `drift=0` would have said nothing about it. The log names the folder (tier 2) or
+shows rsync's own error lines (tier 1). Fix the read access on NAS B for the rsync daemon's user,
+then re-run verify. rc 24 (an entry vanished during the scan) is still normal and is tolerated.
 
 ### Is the sync even running? (status file)
 

@@ -1947,12 +1947,18 @@ CRON_PID=""
 TERM_AT=""
 # Process groups of all running syncs: the initial sync (ours) and each cron job's.
 run_pgids() { ps -eo pgid=,args= | awk '/\/userapp\/scripts\/dispatch-sync\.sh/ {print $1}' | sort -u; }
-# TERM to every sync run that exists right now. Repeating it is harmless, so drain_and_exit
-# calls it again on every poll: a run that started after on_term's scan (a cron tick at that
-# very instant) is still told to stop.
+# TERM to every sync run that exists right now, ONE TERM per run group: a second TERM that lands
+# while rsync is saving its partial file (close, mkdir .rsync-partial, rename) makes it skip
+# the save. drain_and_exit still calls this on every poll, to catch a run that started after
+# the first scan (a cron tick at that very instant); it signals only the groups not yet told.
+SIGNALLED=" "
 signal_runs() {
     local pg
-    for pg in $(run_pgids); do kill -TERM -- "-$pg" 2>/dev/null; done
+    for pg in $(run_pgids); do
+        case "$SIGNALLED" in *" $pg "*) continue ;; esac     # each run group gets ONE TERM
+        SIGNALLED="$SIGNALLED$pg "
+        kill -TERM -- "-$pg" 2>/dev/null
+    done
 }
 on_term() {
     [ -n "$GOT_TERM" ] && return     # signalling our own group re-enters this trap
@@ -1983,7 +1989,8 @@ log "=== INITIAL SYNC (no time limit) ==="
 flock -n /var/lock/nas-sync.lock /userapp/scripts/dispatch-sync.sh &
 INIT_PID=$!
 # The sync is a background job of this shell, so it is in OUR process group: `kill -TERM 0`
-# reaches it even if flock has not exec'd yet and `ps` cannot see it (the §8.6 wrapper does the same).
+# reaches it even if flock has not exec'd yet and `ps` cannot see it (the §8.6 wrapper's trap
+# signals its own group the same way).
 [ -n "$GOT_TERM" ] && kill -TERM 0 2>/dev/null
 wait_child "$INIT_PID"
 [ -n "$GOT_TERM" ] && drain_and_exit

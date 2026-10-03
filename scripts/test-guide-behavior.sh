@@ -12,10 +12,10 @@
 #   (default)  re-run inside `docker run --rm --privileged ubuntu:24.04` — works from
 #              Windows/MSYS and never touches the host. Pass the guide repo-relative.
 #   --native   run on THIS Linux host: needs root, rsync, tini, perl, unshare, nc, flock,
-#              pgrep, comm, mount, mountpoint, timeout (+ cron for --slow). It writes
+#              pgrep, comm, mount, mountpoint, timeout (+ cron, and cc for one sub-case, for --slow). It writes
 #              /userapp/scripts, /etc/cron.d/nas-sync and
 #              /etc/environment (restored afterwards) — use a disposable container or CI.
-#   --slow     add the `deploy` case (waits for a cron minute boundary, ~1-2 min).
+#   --slow     add the `deploy` case (waits for two cron minute boundaries, ~2-3 min).
 #   --case X   run only case X (repeatable): names loose swap lock signal deploy
 #              (deploy implies --slow). An unknown X exits 2; so does a requested case
 #              that was skipped, or a run in which no check ran.
@@ -51,7 +51,7 @@ if [ "$NATIVE" -eq 0 ]; then
     MSYS_NO_PATHCONV=1 exec docker run --rm --privileged -e NGB_KEEP -v "${HOST_DIR}:/repo" -w /repo ubuntu:24.04 bash -c '
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq >/dev/null && apt-get install -y -qq rsync tini perl cron procps util-linux \
-            netcat-openbsd >/dev/null || { echo "apt-get failed"; exit 2; }
+            netcat-openbsd gcc libc6-dev >/dev/null || { echo "apt-get failed"; exit 2; }
         exec bash scripts/test-guide-behavior.sh --native "$@"' _ "${ARGS[@]+"${ARGS[@]}"}"
 fi
 
@@ -158,16 +158,21 @@ mkdir -p "$T/shim"
 cat > "$T/shim/rsync" <<EOF
 #!/bin/bash
 $SHIM_MARK
-bw=""; match=""
+bw=""; match=""; preload=""; stall_ms=""
 [ -f /etc/ngb-rsync-shim.conf ] && . /etc/ngb-rsync-shim.conf
 case " \$* " in *" --daemon "*|*" --list-only "*) exec $REAL_RSYNC "\$@" ;; esac
+# Optional LD_PRELOAD (deploy case, slow cleanup). Set only below the --daemon/--list-only line:
+# just the client rsync gets it, never the daemon.
+[ -n "\$preload" ] && export LD_PRELOAD="\$preload" NGB_STALL_MS="\$stall_ms"
 if [ -n "\$bw" ] && { [ -z "\$match" ] || [[ " \$* " == *"\$match"* ]]; }; then
     exec $REAL_RSYNC --bwlimit="\$bw" "\$@"
 fi
 exec $REAL_RSYNC "\$@"
 EOF
 chmod +x "$T/shim/rsync"
-shim_set() { printf 'bw=%s\nmatch=%s\n' "$1" "${2:-}" > /etc/ngb-rsync-shim.conf; }
+shim_set() {  # shim_set <bwlimit KB/s> [match] [LD_PRELOAD .so] [stall ms]
+    printf 'bw=%s\nmatch=%s\npreload=%q\nstall_ms=%s\n' "$1" "${2:-}" "${3:-}" "${4:-}" > /etc/ngb-rsync-shim.conf
+}
 shim_off() { rm -f /etc/ngb-rsync-shim.conf; }
 
 # date shim (deploy case, "SIGTERM right at start"). log() runs `date`, so holding ONE call parks the
@@ -175,12 +180,14 @@ shim_off() { rm -f /etc/ngb-rsync-shim.conf; }
 # (the test redirects 2>&1 into the log file, so this shell's fd 2 is that file; read it as /proc/$$/fd/2,
 # because grep's own stderr is /dev/null): the one inside log "=== INITIAL SYNC …", where the TERM trap
 # is installed and nothing is forked yet. NGB_HELD is a per-run marker, so only one call is held; the
-# sleep ends early when the TERM (tini -g: the whole group) arrives.
+# sleep ends early when the TERM (tini -g: the whole group) arrives. The marker holds the PARENT's
+# command line, and the test requires it to name entrypoint-deployment: if log() ever stops forking
+# `date`, this shim would hold the dispatcher's call instead, and the sub-case would pass vacuously.
 mkdir -p "$T/shim-date"
 cat > "$T/shim-date/date" <<EOF
 #!/bin/bash
 if grep -q 'OK Cron configured' /proc/\$\$/fd/2 2>/dev/null && [ ! -e "\$NGB_HELD" ]; then
-    : > "\$NGB_HELD"; sleep 5
+    ps -o args= -p "\$PPID" > "\$NGB_HELD"; sleep 5
 fi
 exec $(command -v date) "\$@"
 EOF
@@ -525,11 +532,14 @@ if [ "$SLOW" -eq 1 ] && want deploy; then
         # file behind. That window is ~2 ms wide: the trap goes in ~25-35 ms after the container starts
         # (measured on a fast machine) and the sync is forked 1-2 ms later, so a bare "TERM at ~50 ms"
         # usually arrives after the fork and never reaches it. The date shim above therefore holds the
-        # entrypoint inside the window; the TERM then comes at 0.3 s, which leaves room for a slow machine.
+        # entrypoint inside the window; the TERM goes out as soon as the shim's marker file shows it is
+        # holding (polled, up to 5 s, so a slow machine only takes longer). If the marker never shows,
+        # the TERM is sent anyway and the run fails loudly with held=no.
         # The slow rsync shim makes a sync that does start outlast the 15 s limit. A run counts as
         # clean only if the container stopped within 15 s, exited 143 and left no temp file, AND it
-        # really reached the window: the shim held a call and the trap handled the TERM (otherwise
-        # the run proves nothing: a changed log line, or a machine slower than 0.3 s).
+        # really reached the window: the shim held the ENTRYPOINT's date call (the marker names its
+        # command line) and the trap handled the TERM (otherwise the run proves nothing: a changed
+        # log line, or a log() that no longer forks date).
         fresh_src; mkdir -p "$T/src/big"; head -c 40000000 /dev/urandom > "$T/src/big/blob.bin"
         shim_set 1000                                                         # ~1 MB/s: an unsignalled sync runs ~40 s
         EARLY_N=10; EARLY_OK=0; EARLY_BAD=""
@@ -538,7 +548,7 @@ if [ "$SLOW" -eq 1 ] && want deploy; then
             NGB_HELD="$T/dep-early-$i.held" PATH="$T/shim-date:$PATH" SYNC_MODE=standard LOCAL_NAS_PATH="$DST" CRON_SCHEDULE='* * * * *' \
                 unshare --pid --fork --mount-proc tini -g -- "$S/entrypoint-deployment.sh" > "$elog" 2>&1 &
             u=$!
-            sleep 0.3
+            for _ in $(seq 1 100); do [ -s "$T/dep-early-$i.held" ] && break; sleep 0.05; done
             tpid=$(pgrep -P "$u" -x tini | head -n 1)
             if [ -z "$tpid" ]; then
                 EARLY_BAD="$EARLY_BAD $i(no tini)"; kill -KILL "$u" 2>/dev/null; wait "$u" 2>/dev/null; continue
@@ -549,7 +559,7 @@ if [ "$SLOW" -eq 1 ] && want deploy; then
             kill -0 "$u" 2>/dev/null && kill -KILL "$tpid" "$u" 2>/dev/null
             wait "$u" 2>/dev/null; erc=$?
             orph=$(find "$DST" -name '.blob*' -type f ! -path '*/.rsync-partial/*' | wc -l)
-            held=no;   [ -e "$T/dep-early-$i.held" ] && held=yes                       # the shim parked the entrypoint
+            held=no;   grep -q entrypoint-deployment "$T/dep-early-$i.held" 2>/dev/null && held=yes   # the shim parked the entrypoint
             ontrap=no; grep -qF 'stopping cron, signalling' "$elog" && ontrap=yes      # and the trap handled the TERM
             if [ "$took" -le 15 ] && [ "$erc" -eq 143 ] && [ "$orph" -eq 0 ] && [ "$held" = yes ] && [ "$ontrap" = yes ]; then
                 EARLY_OK=$((EARLY_OK+1))
@@ -559,6 +569,76 @@ if [ "$SLOW" -eq 1 ] && want deploy; then
         done
         check "Deployment, SIGTERM right at start: $EARLY_OK/$EARLY_N runs stopped cleanly within 15 s${EARLY_BAD:+ — failed:$EARLY_BAD}" \
             '[ "$EARLY_OK" -eq "$EARLY_N" ]'
+        # (d) a cron-launched run whose rsync cleanup is SLOW. On a TERM, rsync keeps the partial by
+        # closing the temp file, creating .rsync-partial/ and renaming the temp file into it. A SECOND
+        # TERM that lands during those steps makes rsync run its exit handler again, which skips the
+        # rename: the temp file is orphaned or lost. A drain that re-TERMs every run once a second does
+        # exactly that whenever the cleanup outlasts its first re-TERM (a large close() flushing to a
+        # busy NAS). On tmpfs the cleanup takes ~1 ms, so the stall is injected: an LD_PRELOAD, built
+        # here with cc from a few lines of C, makes rename() into .rsync-partial/ wait STALL_MS with
+        # every signal blocked, like a killable NFS wait (a TERM sent meanwhile fires the moment it
+        # ends). The rsync shim preloads it for the client rsync only (shim_set's 3rd and 4th args).
+        # Two choices make the check deterministic:
+        #  - STALL_MS=3000. rsync starts the cleanup ~0.4 s after the TERM (its handlers sleep 400 ms),
+        #    so the stall covers the drain's re-TERMs at about +1 s, +2 s and +3 s. 1.5 s already
+        #    failed every time against the 7aaf015 guide (6/6); the rest is margin for a slow machine.
+        #  - the preload also delays the generator's kill(SIGUSR1) by 300 ms. That is how the generator
+        #    tells the receiver to wrap up, and it lands at the same ~0.4 s instant as the end of the
+        #    receiver's own TERM handler. If USR1 wins, the receiver cleans up INSIDE that handler,
+        #    where TERM stays masked and no second TERM can reach it: without the delay the check
+        #    passed about half the time against 7aaf015 (5 of 10 at 3 s), whatever the stall.
+        #    Delayed, the receiver always cleans up from its main flow, where a repeated TERM hurts.
+        STALL_MS=3000
+        STALL_SO=""
+        if command -v cc >/dev/null 2>&1; then
+            cat > "$T/stall.c" <<'CEOF'
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <errno.h>
+#include <signal.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/types.h>
+#include <time.h>
+/* rename() into .rsync-partial/ waits NGB_STALL_MS with every signal blocked. */
+int rename(const char *from, const char *to) {
+    static int (*real)(const char *, const char *);
+    const char *ms = getenv("NGB_STALL_MS");
+    if (!real) real = (int (*)(const char *, const char *))dlsym(RTLD_NEXT, "rename");
+    if (ms && to && strstr(to, ".rsync-partial/")) {
+        long n = atol(ms);
+        struct timespec req = { n / 1000, (n % 1000) * 1000000L }, rem;
+        sigset_t all, old;
+        sigfillset(&all);
+        sigprocmask(SIG_BLOCK, &all, &old);
+        while (nanosleep(&req, &rem) == -1 && errno == EINTR) req = rem;
+        sigprocmask(SIG_SETMASK, &old, NULL);
+    }
+    return real(from, to);
+}
+/* kill(pid, SIGUSR1), which the generator sends to the receiver, goes out 300 ms late. */
+int kill(pid_t pid, int sig) {
+    static int (*real)(pid_t, int);
+    struct timespec req = { 0, 300000000L }, rem;
+    if (!real) real = (int (*)(pid_t, int))dlsym(RTLD_NEXT, "kill");
+    if (sig == SIGUSR1 && getenv("NGB_STALL_MS"))
+        while (nanosleep(&req, &rem) == -1 && errno == EINTR) req = rem;
+    return real(pid, sig);
+}
+CEOF
+            cc -shared -fPIC -O1 -o "$T/stall.so" "$T/stall.c" -ldl 2>"$T/stall.cc.log" && STALL_SO="$T/stall.so"
+        fi
+        if [ -z "$STALL_SO" ]; then
+            skip "Deployment, cron-launched run, slow cleanup: no working C compiler (cc) to build the LD_PRELOAD stall (install gcc and libc6-dev)"
+        else
+            fresh_src; echo tiny > "$T/src/tiny.txt"
+            DST=$(fresh_dst dep-slow)
+            ( for _ in $(seq 1 300); do grep -q 'Initial sync done' "$T/dep-slow.log" 2>/dev/null && break; sleep 0.2; done
+              mkdir -p "$T/src/big"; head -c 40000000 /dev/urandom > "$T/src/big/blob.bin" ) &
+            shim_set 4000 "" "$STALL_SO" "$STALL_MS"
+            SYNC_MODE=standard LOCAL_NAS_PATH="$DST" CRON_SCHEDULE='* * * * *' \
+                sigterm_run "Deployment, cron-launched run, slow cleanup" "$DST" "$T/dep-slow.log" "-g" -- "$S/entrypoint-deployment.sh"
+        fi
         # The cron daemon lived inside the PID namespace and died with its PID 1.
         shim_off
         grep -qs "$SHIM_MARK" /usr/local/bin/rsync && rm -f /usr/local/bin/rsync

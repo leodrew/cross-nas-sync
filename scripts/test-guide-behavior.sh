@@ -16,7 +16,7 @@
 #              /userapp/scripts, /etc/cron.d/nas-sync and
 #              /etc/environment (restored afterwards) — use a disposable container or CI.
 #   --slow     add the `deploy` case (waits for two cron minute boundaries, ~2-3 min).
-#   --case X   run only case X (repeatable): names loose swap lock signal deploy
+#   --case X   run only case X (repeatable): names build loose swap lock signal deploy
 #              (deploy implies --slow). An unknown X exits 2; so does a requested case
 #              that was skipped, even in part (`--case deploy` without cc), or a run in which
 #              no check ran. Without --case, a skip is reported and the exit stays 0.
@@ -26,7 +26,7 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SLOW=0; NATIVE=0; GUIDE=""; ONLY=()
-CASES="names loose swap lock signal deploy"
+CASES="names build loose swap lock signal deploy"
 ARGS=("$@")
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -195,6 +195,11 @@ EOF
 chmod +x "$T/shim-date/date"
 
 fresh_src() { rm -rf "$T/src"; mkdir -p "$T/src"; }
+free_port() {  # free_port <first> <last> → echoes the first port in the range nothing listens on
+    local p
+    for p in $(seq "$1" "$2"); do (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null || { echo "$p"; return 0; }; done
+    return 1
+}
 fresh_dst() {  # fresh_dst <name> → echoes a NEW tmpfs mountpoint (the scripts require a mountpoint)
     local d="$T/dst-$1"
     mountpoint -q "$d" 2>/dev/null && umount -l "$d"
@@ -271,6 +276,78 @@ if want names; then
     else
         skip "UTF-8 sub-checks (parallel folder contents, verify tier 2): no C.UTF-8 / C.utf8 locale in 'locale -a'"
     fi
+
+    # log() is printf %()T since the final wave (a $(date) is aborted by a second trapped signal on bash 5.2): same format.
+    check "log() lines keep the 'YYYY-MM-DD HH:MM:SS - ' format" \
+        'grep -Eq "^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} - === NAS SYNC \(parallel" "$T/names.log"'
+
+    # A top-level listing that ends rc 24 (an entry vanished while it ran) is a success, like every other
+    # rsync step (§8.3, §8.10). The shim reports rc 24 for every successful --list-only.
+    mkdir -p "$T/shim-list24"
+    printf '#!/bin/bash\ncase " $* " in *" --list-only "*) %s "$@"; rc=$?; [ "$rc" -eq 0 ] && exit 24; exit "$rc";; esac\nexec %s "$@"\n' \
+        "$REAL_RSYNC" "$REAL_RSYNC" > "$T/shim-list24/rsync"
+    chmod +x "$T/shim-list24/rsync"
+    DST3=$(fresh_dst names-rc24)
+    PATH="$T/shim-list24:$PATH" LOCAL_NAS_PATH="$DST3" PARALLEL_WORKERS=3 timeout --kill-after=10 300 "$S/nas-sync-parallel.sh" > "$T/names-rc24.log" 2>&1
+    RC=$?
+    MIS3=""
+    for d in "${NAMES[@]}"; do
+        [ "$(cat "$DST3/$d/f.txt" 2>/dev/null)" = "content of <$d>" ] || MIS3="$MIS3 $(printf '%q' "$d")"
+    done
+    check "parallel: a top-level listing that ends rc 24 is a success, every folder synced (rc=$RC)${MIS3:+ — wrong:$MIS3}" \
+        '[ "$RC" -eq 0 ] && [ -z "$MIS3" ]'
+    PATH="$T/shim-list24:$PATH" LOCAL_NAS_PATH="$DST3" VERIFY_MODE=checksum VERIFY_SLICES=1 timeout --kill-after=10 300 "$S/nas-sync-verify.sh" > "$T/verify-rc24.log" 2>&1
+    RC=$?
+    check "verify tier 2: a top-level listing that ends rc 24 is a success, drift=0 (rc=$RC)" \
+        '[ "$RC" -eq 0 ] && grep -q "VERIFY RESULT .* drift=0 " "$T/verify-rc24.log"'
+
+    # A daemon that accepts the connection and never answers: the chunk-list fetch and the top-level listing
+    # must give up after RSYNC_LIST_TIMEOUT (rsync --timeout) instead of hanging until the Job deadline.
+    cat > "$T/blackhole.pl" <<'PEOF'
+use IO::Socket::INET;
+my ($port) = @ARGV;
+my $l = IO::Socket::INET->new(Listen => 20, LocalAddr => '127.0.0.1', LocalPort => $port, ReuseAddr => 1) or die "listen: $!";
+my @keep;
+while (my $c = $l->accept) { push @keep, $c; }   # accept, never answer, never close
+PEOF
+    BHPORT=$(free_port 18900 18990)
+    perl "$T/blackhole.pl" "$BHPORT" & BHPID=$!
+    for _ in $(seq 1 50); do nc -z 127.0.0.1 "$BHPORT" 2>/dev/null && break; sleep 0.1; done
+    DST4=$(fresh_dst names-stall)
+    t0=$(date +%s)
+    REMOTE_PORT="$BHPORT" RSYNC_LIST_TIMEOUT=2 LOCAL_NAS_PATH="$DST4" timeout --kill-after=5 40 "$S/nas-sync-parallel.sh" > "$T/names-stall.log" 2>&1
+    RC=$?
+    took=$(( $(date +%s) - t0 ))
+    kill "$BHPID" 2>/dev/null; wait "$BHPID" 2>/dev/null
+    check "stalled daemon: chunk fetch and top-level listing time out (took ${took}s, rc=$RC)" \
+        '[ "$RC" -eq 1 ] && [ "$took" -lt 30 ] && grep -Eq "No chunk lists available \(rc=3[05]\)" "$T/names-stall.log" && grep -Eq "Cannot list top-level folders \(rsync rc=3[05]\)" "$T/names-stall.log"'
+fi
+
+# ================================================================ build
+if want build; then
+    head2 "build — the Dockerfiles' CRLF guard under /bin/sh (§4.4, §8.8)"
+    # `docker build` runs a RUN line with /bin/sh -c (dash on ubuntu:24.04). The guard must FAIL the build on a CRLF
+    # script. v3.12-v3.15 grepped for $'\r', which dash reads as the literal text $\r: it never matched, so the guard
+    # never fired. Each RUN line is taken from the guide, its continuations joined as docker does, its image paths
+    # pointed at a scratch dir, and run with sh -c.
+    for sec in 4.4 8.8; do
+        run=$(awk -v h="### $sec File:" 'index($0,h)==1{f=1;next} f&&/^```dockerfile/{p=1;next} p&&/^```/{exit} p&&/^RUN for f in/{r=1} p&&r{print} p&&r&&!/\\$/{exit}' "$GUIDE" | tr -d '\r')
+        if [ -z "$run" ]; then bad "§$sec: no 'RUN for f in …' CRLF guard found in the Dockerfile block"; continue; fi
+        W="$T/build-$sec"; rm -rf "$W"; mkdir -p "$W/userapp/scripts"
+        cmd=$(printf '%s\n' "$run" | sed -e ':a;/\\$/{N;s/\\\n//;ba}' -e 's/^RUN //' \
+              | sed "s#/entrypoint.sh#$W/entrypoint.sh#g; s#/userapp/scripts/#$W/userapp/scripts/#g")
+        for f in entrypoint.sh userapp/scripts/generate-manifests.sh userapp/scripts/generate-chunks.sh userapp/scripts/nas-sync-state-lock.sh userapp/scripts/other.sh; do
+            printf '#!/bin/bash\necho hi\n' > "$W/$f"
+        done
+        sh -c "$cmd" > "$W/out0" 2>&1; RC0=$?
+        check "§$sec guard: LF scripts pass the build (rc=$RC0)" '[ "$RC0" -eq 0 ]'
+        printf '#!/bin/bash\r\necho hi\r\n' > "$W/userapp/scripts/nas-sync-state-lock.sh"       # CRLF, shebang included
+        sh -c "$cmd" > "$W/out1" 2>&1; RC1=$?
+        check "§$sec guard: a CRLF script FAILS the build under $(readlink -f /bin/sh) (rc=$RC1)" '[ "$RC1" -ne 0 ] && grep -q "ERROR: CRLF" "$W/out1"'
+        printf '#!/bin/bash\necho hi\r\n' > "$W/userapp/scripts/nas-sync-state-lock.sh"         # CR on a later line only
+        sh -c "$cmd" > "$W/out2" 2>&1; RC2=$?
+        check "§$sec guard: a CR on a later line fails the build too (rc=$RC2)" '[ "$RC2" -ne 0 ] && grep -q "ERROR: CRLF" "$W/out2"'
+    done
 fi
 
 # ================================================================ loose
@@ -387,6 +464,82 @@ if want lock; then
     wait "$HPID"; RC=$?
     check "heartbeat keeps running after a failed touch [rc=$RC, acquired=$ACQ, heartbeat=$HB]" \
         '[ "$RC" -eq 0 ] && [ -e "$T/hb.failed" ] && awk -v a="$ACQ" -v h="$HB" "BEGIN{exit !(a > 0 && h > a + 1)}" && grep -q "lock heartbeat touch failed" "$T/hb.log"'
+
+    # ---- edge cases of the lock library (§4.7, final wave) ----
+    LOCKD="$STATE_DIR/locks/chunks.lock"
+    rm -rf "$LOCKD"
+    mklock() {  # mklock <dir age s> <heartbeat age s | none>: a lock held by "live-holder"
+        rm -rf "$LOCKD"; mkdir -p "$LOCKD"
+        printf 'run_id=live-holder\n' > "$LOCKD/owner"
+        [ "$2" = none ] || "$REAL_TOUCH" -d "@$(( $(date +%s) - $2 ))" "$LOCKD/heartbeat"
+        "$REAL_TOUCH" -d "@$(( $(date +%s) - $1 ))" "$LOCKD"          # last: creating the files above moves the dir's mtime
+    }
+    # m1: the heartbeat file EXISTS but stat on it fails (stale handle, I/O error). The lock dir's own mtime is the
+    # acquisition time, 2 h old here: falling back to it would break a live lock. Only a MISSING heartbeat file
+    # (the holder died between mkdir and its first touch) may fall back to the dir mtime.
+    mkdir -p "$T/nostat"
+    printf '#!/bin/bash\nfor a in "$@"; do case "$a" in */heartbeat) echo "stat: cannot statx: Stale file handle" >&2; exit 1;; esac; done\nexec %s "$@"\n' \
+        "$(command -v stat)" > "$T/nostat/stat"
+    chmod +x "$T/nostat/stat"
+    mklock 7200 5
+    PATH="$T/nostat:$PATH" timeout --kill-after=10 300 "$S/generate-chunks.sh" > "$T/hbstat.log" 2>&1; RC=$?
+    check "live lock is not broken when its heartbeat exists but cannot be stat'ed (exit 75) [rc=$RC]" \
+        '[ "$RC" -eq 75 ] && grep -qx "run_id=live-holder" "$LOCKD/owner" 2>/dev/null && grep -q "cannot determine the age" "$T/hbstat.log"'
+    mklock 7200 none
+    timeout --kill-after=10 300 "$S/generate-chunks.sh" > "$T/nohb.log" 2>&1; RC=$?
+    check "lock with NO heartbeat file and an old dir mtime (holder died before its first touch) is broken [rc=$RC]" \
+        '[ "$RC" -eq 0 ] && grep -q "stale" "$T/nohb.log"'
+    # m2: LOCK_STALE below 2 x LOCK_HEARTBEAT would let a contender break a live lock: WARN and use 600/60.
+    mklock 3 3
+    LOCK_HEARTBEAT=5 LOCK_STALE=2 timeout --kill-after=10 300 "$S/generate-chunks.sh" > "$T/inconsistent.log" 2>&1; RC=$?
+    check "LOCK_STALE < 2 x LOCK_HEARTBEAT: WARN, defaults used, a 3 s-old live lock is not broken (exit 75) [rc=$RC]" \
+        '[ "$RC" -eq 75 ] && grep -q "must be at least 2 x LOCK_HEARTBEAT" "$T/inconsistent.log" && grep -qx "run_id=live-holder" "$LOCKD/owner" 2>/dev/null'
+    rm -rf "$LOCKD"
+    # M5: lock_release left the heartbeat's sleep running, and it held the job's stdout for up to LOCK_HEARTBEAT
+    # seconds: `generate-... | tee` stalled after the job had finished. With LOCK_HEARTBEAT=10 the pipeline must
+    # close within seconds of the generator's exit.
+    t0=$(date +%s.%N)
+    LOCK_HEARTBEAT=10 timeout --kill-after=10 300 "$S/generate-chunks.sh" 2>&1 | cat > "$T/pipe.log"
+    t1=$(date +%s.%N)
+    HELD=$(awk -v a="$t0" -v b="$t1" 'BEGIN{printf "%.1f", b - a}')
+    check "the heartbeat does not hold the job's stdout open after release (pipeline closed after ${HELD}s, LOCK_HEARTBEAT=10)" \
+        'grep -q "^.* - Done\.$" "$T/pipe.log" && awk -v h="$HELD" "BEGIN{exit !(h < 5)}"'
+    # m3: a SIGKILLed holder's heartbeat loop must die with it, or the orphan keeps a dead run's lock fresh for ever.
+    # The generator runs in its own session (setsid), is killed 1 s after it took the lock, and the heartbeat must be
+    # frozen by the time we look (2.5 s later, LOCK_HEARTBEAT=1), and stay frozen.
+    rm -rf "$LOCKD"
+    LOCK_HEARTBEAT=1 PATH="$T/slowfind:$PATH" setsid "$S/generate-chunks.sh" > "$T/orphan.log" 2>&1 &
+    disown $!                                                      # its SIGKILL below is expected: no job notice
+    for _ in $(seq 1 100); do grep -q '^pid=' "$LOCKD/owner" 2>/dev/null && break; sleep 0.05; done
+    GPID=$(sed -n 's/^pid=//p' "$LOCKD/owner" 2>/dev/null)
+    GPG=$(ps -o pgid= -p "${GPID:-0}" 2>/dev/null | tr -d ' ')
+    sleep 1
+    [ -n "$GPID" ] && kill -KILL "$GPID" 2>/dev/null
+    sleep 2.5
+    HB1=$(stat -c %.3Y "$LOCKD/heartbeat" 2>/dev/null || echo 0); sleep 2.2; HB2=$(stat -c %.3Y "$LOCKD/heartbeat" 2>/dev/null || echo 0)
+    # remove what is left of the killed run (never our own process group)
+    [ -n "$GPG" ] && [ "$GPG" != "$(ps -o pgid= -p $$ | tr -d ' ')" ] && kill -KILL -- "-$GPG" 2>/dev/null
+    rm -rf "$LOCKD" "$STATE_DIR/common"/.chunks.tmp*
+    check "a SIGKILLed holder's heartbeat loop stops (heartbeat $HB1 -> $HB2)" '[ "$HB1" != 0 ] && [ "$HB1" = "$HB2" ]'
+    # M1: three runs race for one stale lock. A slow contender renames away a FRESH lock (another run broke the stale one
+    # and took the name), and a third run takes the name before the restore: the displaced lock cannot go back and
+    # used to be stranded as locks/<job>.lock.stale.<run> for ever. The two overtaking runs are injected as a `mv` hook.
+    M1S="$T/m1state"; rm -rf "$M1S"; mkdir -p "$M1S/locks/job.lock"
+    printf 'run_id=dead-pod\n' > "$M1S/locks/job.lock/owner"
+    "$REAL_TOUCH" -d "@$(( $(date +%s) - 1200 ))" "$M1S/locks/job.lock/owner" "$M1S/locks/job.lock"
+    bash -c '
+        . "$1"; STATE_DIR="$2"; log() { echo "$1"; }
+        mv() {
+            case "$1" in
+                -T) mkdir "$LOCK_PATH" && printf "run_id=Z\n" > "$LOCK_PATH/owner" ;;
+                *)  rm -rf "$LOCK_PATH"; mkdir "$LOCK_PATH"; printf "run_id=X\n" > "$LOCK_PATH/owner"; touch "$LOCK_PATH/heartbeat" ;;
+            esac
+            command mv "$@"
+        }
+        lock_acquire job' _ "$S/nas-sync-state-lock.sh" "$M1S" > "$T/m1race.log" 2>&1; RC=$?
+    STRANDED=$(ls -A "$M1S/locks" | grep -c '\.lock\.stale\.')
+    check "a lock displaced by mistake is not stranded as *.lock.stale.* when a third run takes the name (exit 75, stranded=$STRANDED) [rc=$RC]" \
+        '[ "$RC" -eq 75 ] && [ "$STRANDED" -eq 0 ] && grep -q "could not restore" "$T/m1race.log"'
     unset SOURCE_PATH STATE_DIR REGISTRY_FILE CHUNK_COUNT
 fi
 
@@ -501,6 +654,64 @@ if want signal; then
     done
     check "SIGTERM during pre-flight, $LOOP_N runs under tini -g: $LOOP_OK/$LOOP_N runs exited 143 with a valid status line${LOOP_BAD:+ — failed:$LOOP_BAD}" \
         '[ "$LOOP_OK" -eq "$LOOP_N" ]'
+
+    # ---- the wrapper's sidecar-quit phase (§8.6) ----
+    # A fake istio-proxy admin port: records POST /quitquitquit, holds its reply for <delay> s, answers, then exits
+    # (so the wrapper sees the port close). A bare connect-and-close, like the wrapper's `nc -z` probe, is ignored.
+    cat > "$T/sidecar.pl" <<'PEOF'
+use IO::Socket::INET;
+my ($port, $mark, $delay) = @ARGV;
+my $l = IO::Socket::INET->new(Listen => 5, LocalAddr => '127.0.0.1', LocalPort => $port, ReuseAddr => 1) or die "listen: $!";
+while (my $c = $l->accept) {
+    $c->autoflush(1);
+    my $req = <$c>;
+    if (defined $req && $req =~ m{^POST /quitquitquit}) {
+        open(my $f, '>>', $mark) or die; print $f $req; close $f;
+        sleep $delay;
+        print $c "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        close $c; close $l; exit 0;
+    }
+    close $c;
+}
+PEOF
+    # M4: nas-sync-lib.sh missing. v3.16 exited before the sidecar quit, so the Job pod hung NotReady instead of
+    # failing. The wrapper and the dispatcher are copied next to NO library: the sync cannot run, but the sidecar
+    # must still be quit and the exit status must be non-zero.
+    mkdir -p "$T/nolib"
+    cp "$S/dispatch-sync.sh" "$T/nolib/"
+    sed "s#/userapp/scripts/dispatch-sync.sh#$T/nolib/dispatch-sync.sh#" "$S/run-with-sidecar-quit.sh" > "$T/nolib/run-with-sidecar-quit.sh"
+    chmod +x "$T/nolib/"*.sh
+    rm -f "$T/quit.mark"; AP=$(free_port 18900 18990)
+    perl "$T/sidecar.pl" "$AP" "$T/quit.mark" 0 & SPID=$!
+    for _ in $(seq 1 50); do nc -z 127.0.0.1 "$AP" 2>/dev/null && break; sleep 0.1; done
+    ISTIO_ADMIN_PORT="$AP" timeout --kill-after=5 60 "$T/nolib/run-with-sidecar-quit.sh" > "$T/nolib.log" 2>&1; RC=$?
+    kill "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null
+    check "wrapper without nas-sync-lib.sh still quits the sidecar and exits non-zero (rc=$RC)" \
+        '[ "$RC" -ne 0 ] && [ -s "$T/quit.mark" ] && grep -q "nas-sync-lib.sh not found" "$T/nolib.log"'
+    # M5: a TERM during the sidecar-quit phase must not re-enter the sync trap, whose group `kill -TERM 0` would also
+    # hit curl/nc. The fake sidecar holds its reply for 4 s and the TERM goes to tini once the POST has arrived (the
+    # quit phase). Armed, the trap ran once curl returned and logged "SIGTERM — signalling the sync"; reset, the
+    # wrapper just ends. (Under tini in a PID namespace like the other cases: that group TERM stays inside it.)
+    fresh_src; echo tiny > "$T/src/tiny.txt"
+    DST=$(fresh_dst quitphase)
+    rm -f "$T/quit.mark"; AP=$(free_port 18900 18990)
+    perl "$T/sidecar.pl" "$AP" "$T/quit.mark" 4 & SPID=$!
+    for _ in $(seq 1 50); do nc -z 127.0.0.1 "$AP" 2>/dev/null && break; sleep 0.1; done
+    SYNC_MODE=standard LOCAL_NAS_PATH="$DST" ISTIO_ADMIN_PORT="$AP" \
+        unshare --pid --fork --mount-proc tini -g -- "$S/run-with-sidecar-quit.sh" > "$T/quitphase.log" 2>&1 &
+    u=$!
+    for _ in $(seq 1 150); do [ -s "$T/quit.mark" ] && break; sleep 0.1; done
+    tpid=$(pgrep -P "$u" -x tini | head -n 1)
+    [ -n "$tpid" ] && kill -TERM "$tpid"
+    for _ in $(seq 1 100); do kill -0 "$u" 2>/dev/null || break; sleep 0.1; done
+    kill -0 "$u" 2>/dev/null && { kill -KILL "$tpid" "$u" 2>/dev/null; echo "(killed after 10s)" >> "$T/quitphase.log"; }
+    wait "$u" 2>/dev/null
+    kill "$SPID" 2>/dev/null; wait "$SPID" 2>/dev/null
+    check "TERM during the sidecar-quit phase does not re-enter the sync trap" \
+        '[ -s "$T/quit.mark" ] && [ -n "$tpid" ] && grep -q "Sync exited: 0" "$T/quitphase.log" && ! grep -q "SIGTERM — signalling" "$T/quitphase.log"'
+    # log() is printf %()T in the wrapper and the dispatcher since the final wave: same format as before.
+    check "log() lines keep their format: '<date> <time> [wrapper] …' and '… [dispatch] …'" \
+        'grep -Eq "^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} \[wrapper\] === Wrapper start" "$T/quitphase.log" && grep -Eq "^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2} \[dispatch\] Mode: standard" "$T/quitphase.log"'
 fi
 
 # ================================================================ deploy (--slow)

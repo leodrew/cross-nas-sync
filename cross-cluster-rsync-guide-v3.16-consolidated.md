@@ -196,7 +196,7 @@ cd cluster-b/scripts
 ```bash
 #!/bin/bash
 #############################################
-# NAS Sync Server v3.15 — Entrypoint
+# NAS Sync Server v3.16 — Entrypoint
 #############################################
 set +e
 RSYNC_PORT="${RSYNC_PORT:-8787}"
@@ -265,7 +265,8 @@ NOW=$(date +%s)
 # v3.16: every temp name carries the run id. $$ alone repeats across containers.
 RUN_ID="${HOSTNAME:-unknown}-$$-${NOW}"
 
-# v3.16: one generator at a time (§4.7). Exits 75 if another run holds the lock.
+# v3.16: one generator at a time (§4.7). Exits 75 if another run holds the lock, or if the
+# lock's age cannot be read (fail closed: the NAS is unhealthy, §13).
 . "$(dirname "${BASH_SOURCE[0]}")/nas-sync-state-lock.sh" \
     || { log "ERROR: nas-sync-state-lock.sh not found next to this script (§4.7)"; exit 1; }
 lock_acquire manifests
@@ -407,12 +408,13 @@ RUN dos2unix /entrypoint.sh \
         /userapp/scripts/generate-chunks.sh \
         /userapp/scripts/nas-sync-state-lock.sh
 
-# Fail build if any CRLF remains
+# Fail build if any CRLF remains. RUN uses /bin/sh (dash), where $'\r' is not a carriage return
+# (v3.12-v3.15 grepped for the literal text and never fired), so count the CR bytes with tr.
 RUN for f in /entrypoint.sh \
              /userapp/scripts/generate-manifests.sh \
              /userapp/scripts/generate-chunks.sh \
              /userapp/scripts/nas-sync-state-lock.sh; do \
-        if head -1 "$f" | grep -q $'\r'; then \
+        if [ "$(tr -cd '\r' < "$f" | wc -c)" -ne 0 ]; then \
             echo "ERROR: CRLF in $f" && exit 1; \
         fi; \
     done && echo "Scripts verified LF-clean"
@@ -480,7 +482,8 @@ GEN="g${NOW}"
 TMP_DIR="${STATE_DIR}/common/.chunks.tmp.${RUN_ID}"
 OLD_DIR="${STATE_DIR}/common/.chunks.old.${RUN_ID}"
 
-# v3.16: one generator at a time (§4.7). Exits 75 if another run holds the lock.
+# v3.16: one generator at a time (§4.7). Exits 75 if another run holds the lock, or if the
+# lock's age cannot be read (fail closed: the NAS is unhealthy, §13).
 . "$(dirname "${BASH_SOURCE[0]}")/nas-sync-state-lock.sh" \
     || { log "ERROR: nas-sync-state-lock.sh not found next to this script (§4.7)"; exit 1; }
 lock_acquire chunks
@@ -592,7 +595,7 @@ log "Done."
 
 LOCK_HEARTBEAT="${LOCK_HEARTBEAT:-60}"   # seconds between heartbeat touches
 LOCK_STALE="${LOCK_STALE:-600}"          # a heartbeat older than this = holder is dead
-LOCK_EXIT_HELD=75                        # EX_TEMPFAIL: "another run holds the lock"
+LOCK_EXIT_HELD=75                        # EX_TEMPFAIL: "another run holds the lock", or its age is unknown
 LOCK_RUN_ID="${RUN_ID:-${HOSTNAME:-unknown}-$$-$(date +%s)}"
 LOCK_PATH=""
 LOCK_HB_PID=""
@@ -614,13 +617,22 @@ _lock_nas_now() {
     echo "$t"
 }
 
-# Seconds since the lock's last heartbeat (its dir mtime if the heartbeat file is missing).
+# Seconds since the lock's last heartbeat. The heartbeat file is the clock; the lock dir's own
+# mtime stands in ONLY when that file does not exist (the holder died between mkdir and its
+# first touch). Any other stat failure on an existing heartbeat (stale handle, I/O error) means
+# "unknown": a long-running live holder's dir mtime is its acquisition time, hours old, and
+# reading it would break a live lock.
 # FAILS CLOSED: if the age cannot be measured it prints nothing and returns 1 — never a
 # made-up huge number, which the caller would take for "stale" and break a live lock.
 _lock_age() {
     local now hb
     now=$(_lock_nas_now) || return 1
-    hb=$(stat -c %Y "$1/heartbeat" 2>/dev/null || stat -c %Y "$1" 2>/dev/null) || return 1
+    if ! hb=$(LC_ALL=C stat -c %Y "$1/heartbeat" 2>&1); then
+        case "$hb" in
+            *"No such file or directory"*) hb=$(stat -c %Y "$1" 2>/dev/null) || return 1 ;;
+            *) return 1 ;;
+        esac
+    fi
     case "$hb" in ''|*[!0-9]*) return 1;; esac
     echo $(( now - hb ))
 }
@@ -633,12 +645,19 @@ lock_release() {
     return 0
 }
 
-# lock_acquire <name>: returns 0 holding the lock, or EXITS 75 (lock held) / 1 (cannot lock).
+# lock_acquire <name>: returns 0 holding the lock, or EXITS 75 (lock held, or its age is unknown)
+# / 1 (cannot lock).
 lock_acquire() {
     local name="$1" attempt age owner stale_dir mkerr
     # A bad LOCK_* value must not turn into a failed test that reads as "not stale".
     _lock_posint "$LOCK_HEARTBEAT" || { log "WARN: LOCK_HEARTBEAT='${LOCK_HEARTBEAT}' is not a positive integer — using 60"; LOCK_HEARTBEAT=60; }
     _lock_posint "$LOCK_STALE"     || { log "WARN: LOCK_STALE='${LOCK_STALE}' is not a positive integer — using 600"; LOCK_STALE=600; }
+    # A live holder's heartbeat is up to LOCK_HEARTBEAT old, so LOCK_STALE below 2 x LOCK_HEARTBEAT
+    # lets a contender break a live lock. (LOCK_STALE/2 rather than 2*LOCK_HEARTBEAT: no overflow.)
+    if [ $(( LOCK_STALE / 2 )) -lt "$LOCK_HEARTBEAT" ]; then
+        log "WARN: LOCK_STALE=${LOCK_STALE} must be at least 2 x LOCK_HEARTBEAT=${LOCK_HEARTBEAT} — using 600 and 60"
+        LOCK_STALE=600; LOCK_HEARTBEAT=60
+    fi
     mkdir -p "${STATE_DIR}/locks" || { log "ERROR: cannot create ${STATE_DIR}/locks (source NAS writable?)"; exit 1; }
     LOCK_PATH="${STATE_DIR}/locks/${name}.lock"
     for attempt in 1 2; do
@@ -647,7 +666,11 @@ lock_acquire() {
                 "$LOCK_RUN_ID" "${HOSTNAME:-unknown}" "$$" "$(date +%s)" > "${LOCK_PATH}/owner"
             touch "${LOCK_PATH}/heartbeat"
             # A failed touch (transient NFS error) must not end the loop: it warns and retries next interval.
-            ( while sleep "$LOCK_HEARTBEAT"; do
+            # The loop ends with its parent: lock_release kills it, and `kill -0 $$` ends it within one
+            # interval even if the parent was SIGKILLed (an orphan would keep a dead run's lock fresh
+            # for ever). The sleep gets /dev/null: left behind by lock_release it would otherwise hold
+            # the job's stdout open for up to LOCK_HEARTBEAT seconds, stalling `generate-… | tee`.
+            ( while sleep "$LOCK_HEARTBEAT" >/dev/null 2>&1 && kill -0 "$$" 2>/dev/null; do
                   touch "${LOCK_PATH}/heartbeat" 2>/dev/null \
                       || echo "$(date '+%Y-%m-%d %H:%M:%S') - WARN: lock heartbeat touch failed (${LOCK_PATH}/heartbeat); retrying in ${LOCK_HEARTBEAT}s" >&2
               done ) &
@@ -665,7 +688,7 @@ lock_acquire() {
         owner=$(cat "${LOCK_PATH}/owner" 2>/dev/null)
         if ! age=$(_lock_age "$LOCK_PATH"); then
             [ -d "$LOCK_PATH" ] || continue        # released while we looked: retry
-            log "ERROR: cannot determine the age of lock '${name}' (NAS-clock probe or stat failed; owner [$(printf '%s' "$owner" | tr '\n' ' ')]) — treating it as held; this run did nothing."
+            log "ERROR: cannot determine the age of lock '${name}' (NAS-clock probe or stat failed; owner [$(printf '%s' "$owner" | tr '\n' ' ')]) — treating it as held; this run did nothing. Check the source NAS: full, over quota, read-only or a stale mount."
             exit "$LOCK_EXIT_HELD"
         fi
         if [ "$age" -le "$LOCK_STALE" ]; then
@@ -679,7 +702,12 @@ lock_acquire() {
             || { log "ERROR: another run broke lock '${name}' first; this run did nothing"; exit "$LOCK_EXIT_HELD"; }
         if [ "$(cat "${stale_dir}/owner" 2>/dev/null)" != "$owner" ]; then
             # We moved a FRESH lock that another run took after breaking the stale one: put it back.
-            mv -T "$stale_dir" "$LOCK_PATH" 2>/dev/null || log "WARN: could not restore lock '${name}' moved by mistake"
+            if ! mv -T "$stale_dir" "$LOCK_PATH" 2>/dev/null; then
+                # A third run took the name meanwhile, so the lock cannot go back. Remove it rather than
+                # strand it as a *.lock.stale.* dir that no run ever cleans up.
+                log "WARN: could not restore lock '${name}' moved by mistake"
+                [ -d "$LOCK_PATH" ] && rm -rf "$stale_dir"
+            fi
             log "ERROR: another run broke lock '${name}' first; this run did nothing"
             exit "$LOCK_EXIT_HELD"
         fi
@@ -1169,8 +1197,12 @@ REMOTE_URL="rsync://${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PORT}/${REMOTE_MODULE
 PREFLIGHT_RETRIES="${PREFLIGHT_RETRIES:-10}"
 PREFLIGHT_WAIT="${PREFLIGHT_WAIT:-6}"
 
-log() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"; }
-log_error() { echo "$(date '+%Y-%m-%d %H:%M:%S') - ERROR: $1" >&2; }
+# v3.16: printf %()T, not $(date): bash 5.2 aborts the command that contains a command substitution
+# when a SECOND trapped signal arrives while it runs. The shutdown path can send two TERMs within
+# milliseconds (tini -g, then the wrapper's group TERM); measured ~0.7% of runs in the pre-flight
+# loop. Same output as `date '+%Y-%m-%d %H:%M:%S'`.
+log() { printf '%(%Y-%m-%d %H:%M:%S)T - %s\n' -1 "$1"; }
+log_error() { printf '%(%Y-%m-%d %H:%M:%S)T - ERROR: %s\n' -1 "$1" >&2; }
 die() { log_error "$1"; exit "${2:-1}"; }
 
 # v3.16: shared helpers (§8.11). On SIGTERM, let rsync save its partial, then stop.
@@ -1248,6 +1280,14 @@ exit $SYNC_EXIT
 #   when chunks are missing, stale or not one
 #   consistent generation — a failed chunk job
 #   never blocks a run.
+#
+# Timeouts (rsync --timeout = idle seconds, not run time):
+#   RSYNC_TIMEOUT       14400  the data transfers
+#   RSYNC_LIST_TIMEOUT    300  the small metadata rsyncs: chunk-list
+#                              fetch and top-level listing (§8.11). A
+#                              dead connection fails in minutes, and
+#                              the run falls back or stops, instead of
+#                              hanging until the Job deadline.
 #############################################
 set +e
 
@@ -1259,6 +1299,7 @@ LOCAL_NAS_PATH="${LOCAL_NAS_PATH:-/mnt/nas-target}"
 RSYNC_PASSWORD_FILE="${RSYNC_PASSWORD_FILE:-/userapp/config/rsync.password}"
 EXCLUDE_FILE="${EXCLUDE_FILE:-/userapp/config/rsync-exclude.txt}"
 RSYNC_TIMEOUT="${RSYNC_TIMEOUT:-14400}"
+RSYNC_LIST_TIMEOUT="${RSYNC_LIST_TIMEOUT:-300}"
 PARALLEL_WORKERS="${PARALLEL_WORKERS:-6}"
 PREFLIGHT_RETRIES="${PREFLIGHT_RETRIES:-10}"
 PREFLIGHT_WAIT="${PREFLIGHT_WAIT:-6}"
@@ -1276,16 +1317,19 @@ CHUNK_DIR="${WORK_DIR}/chunks"
 RC_DIR="${WORK_DIR}/rc"                # one rc file per unit — nothing else in here
 NAME_DIR="${WORK_DIR}/names"           # folder name per index, for the failure report
 CHUNK_LIST="${WORK_DIR}/chunks.bin"    # sorted chunk paths, NUL-terminated (outside CHUNK_DIR)
-STOP_FILE="${WORK_DIR}/stop"           # created by the SIGTERM trap (§8.11): queued units must not start
+STOP_FILE="${WORK_DIR}/stop"           # created by the SIGTERM trap (§8.11): queued units check it before they start
 REMOTE_URL="rsync://${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PORT}/${REMOTE_MODULE}"
 
 # v3.16: folder names are raw bytes, not characters. bash 5.2 `read -d ''` under a UTF-8 locale
 # silently loses the record after a name that ends in a UTF-8 lead byte (legacy Big5/MS950 names
-# often do). C is also the image's default locale, so this only makes it explicit.
+# often do). C is also the image's default locale, so this mostly makes it explicit. It also
+# overrides a LANG/LC_ALL the deployer sets, so the log shows non-ASCII folder names as octal
+# escapes (rsync \#344, bash $'\344'); the data is unaffected.
 export LC_ALL=C
 
-log() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"; }
-log_error() { echo "$(date '+%Y-%m-%d %H:%M:%S') - ERROR: $1" >&2; }
+# v3.16: printf %()T, not $(date): see §8.2.
+log() { printf '%(%Y-%m-%d %H:%M:%S)T - %s\n' -1 "$1"; }
+log_error() { printf '%(%Y-%m-%d %H:%M:%S)T - ERROR: %s\n' -1 "$1" >&2; }
 die() { log_error "$1"; exit "${2:-1}"; }
 
 # v3.16: shared helpers (§8.11). On SIGTERM, let rsync save its partial, then stop.
@@ -1337,8 +1381,10 @@ log "OK Pre-flight"
 export REMOTE_URL LOCAL_NAS_PATH RSYNC_FLAGS CHUNK_DIR RC_DIR NAME_DIR STOP_FILE
 
 # ---- Worker: one server-generated chunk list ----
-# v3.16: after SIGTERM no new unit may start. The trap (§8.11) creates STOP_FILE; a unit that
+# v3.16: after SIGTERM no new unit should start. The trap (§8.11) creates STOP_FILE; a unit that
 # finds it logs SKIP and records rc 143, so the rc-file count still equals the unit count.
+# A unit already past this check when the TERM lands (a window of a few ms, before its rsync is
+# forked) still starts: it missed the group TERM and runs until it ends or the grace period does.
 sync_one_chunk() {
     local chunk="$1"
     local name; name=$(basename "$chunk")
@@ -1388,12 +1434,12 @@ export -f sync_one_folder
 fetch_chunks() {
     local rc meta="${CHUNK_DIR}/chunks.meta" gen_at count n_all
     rm -rf "$CHUNK_DIR"; mkdir -p "$CHUNK_DIR"
-    rsync -a --password-file="$RSYNC_PASSWORD_FILE" \
+    rsync -a --timeout="$RSYNC_LIST_TIMEOUT" --password-file="$RSYNC_PASSWORD_FILE" \
         "${REMOTE_URL}/${CHUNKS_REMOTE}/" "${CHUNK_DIR}/" >/dev/null 2>&1
     rc=$?
     check_term
     if [ "$rc" -eq 24 ]; then
-        CHUNK_REASON="Chunk files vanished mid-fetch (rc=24) — the server is publishing a new generation"
+        CHUNK_REASON="Chunk files vanished mid-fetch (rc=24): the server is publishing a new generation"
         return 2
     fi
     if [ "$rc" -ne 0 ] || [ ! -f "$meta" ]; then
@@ -1412,8 +1458,9 @@ fetch_chunks() {
     TOTAL_FILES=$(awk -F= '/^total_files=/{print $2}' "$meta")
     n_all=$(find "$CHUNK_DIR" -maxdepth 1 -name 'chunk-*.txt' | wc -l | tr -d ' ')
     if [ -z "$CHUNK_GEN" ]; then
-        # Only after a rollback to a v3.15 server: same acceptance rule as v3.15.
-        log "WARN: chunks.meta has no generation (v3.15 server) — cannot prove the set is one generation"
+        # The set was written by a v3.15 server: after a rollback, or after a normal upgrade until the
+        # first v3.16 chunk run replaces it. Same acceptance rule as v3.15.
+        log "WARN: chunks.meta has no generation (set written by a v3.15 server: after a rollback, or until the first v3.16 chunk run) — cannot prove the set is one generation"
         CHUNK_GLOB='chunk-*.txt'
         NCHUNK=$n_all
     else
@@ -1452,7 +1499,8 @@ if [ "$USE_CHUNKS" = true ]; then
     UNIT_COUNT="$NCHUNK"
     EXPECTED_RC="$NCHUNK"
     # On SIGTERM: the rsyncs already running stop themselves and save their partials (§8.11),
-    # units still queued are skipped (STOP_FILE), and the script exits 143.
+    # units still queued are skipped (STOP_FILE; one a few ms from forking its rsync is not), and
+    # the script exits 143.
     # xargs ignores TERM so it keeps waiting for the in-flight workers, and runs in the
     # BACKGROUND so the trap fires at once: bash defers a trap until a foreground pipeline
     # ends, and by then xargs would have started every remaining unit. -0 so no character in
@@ -1467,7 +1515,8 @@ else
     list_top_dirs > "$NAMES_BIN"
     LIST_RC=$?
     check_term
-    [ "$LIST_RC" -eq 0 ] || die "Cannot list top-level folders (rsync rc=$LIST_RC)"
+    # rc 24 (an entry vanished during the listing) is normal on a live source, like everywhere else.
+    rsync_rc_ok "$LIST_RC" || die "Cannot list top-level folders (rsync rc=$LIST_RC)"
     UNIT_COUNT=$(tr -cd '\0' < "$NAMES_BIN" | wc -c | tr -d ' ')
     log "Found $UNIT_COUNT top-level folders"
     [ "$UNIT_COUNT" -gt 0 ] || die "No folders found"
@@ -1487,7 +1536,7 @@ else
         printf '%s\0%s\0' "$i" "$n"
     done < "$NAMES_BIN" > "$FOLDER_LIST"
     # Same shutdown rules as the chunk path above: background xargs that ignores TERM, queued
-    # units skipped via STOP_FILE, running rsyncs save their partials, exit 143.
+    # units skipped via STOP_FILE (same few-ms exception), running rsyncs save their partials, exit 143.
     ( trap '' TERM; exec xargs -0 -n 2 -P "$PARALLEL_WORKERS" bash -c 'sync_one_folder "$1" "$2"' _ ) < "$FOLDER_LIST" &
     wait_child $!
     XARGS_RC=$WAIT_RC
@@ -1589,8 +1638,9 @@ MANIFEST_LOCAL="${WORK_DIR}/sync-manifest.txt"
 META_LOCAL="${WORK_DIR}/manifest.meta"
 REMOTE_URL="rsync://${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PORT}/${REMOTE_MODULE}"
 
-log() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"; }
-log_error() { echo "$(date '+%Y-%m-%d %H:%M:%S') - ERROR: $1" >&2; }
+# v3.16: printf %()T, not $(date): see §8.2.
+log() { printf '%(%Y-%m-%d %H:%M:%S)T - %s\n' -1 "$1"; }
+log_error() { printf '%(%Y-%m-%d %H:%M:%S)T - ERROR: %s\n' -1 "$1" >&2; }
 die() { log_error "$1"; exit "${2:-1}"; }
 
 # v3.16: shared helpers (§8.11). On SIGTERM, let rsync save its partial, then stop.
@@ -1725,7 +1775,8 @@ LOCAL_NAS_PATH="${LOCAL_NAS_PATH:-/mnt/nas-target}"
 STATUS_DIR="${STATUS_DIR:-${LOCAL_NAS_PATH}/.nas-sync-status}"
 STATUS_ENABLED="${STATUS_ENABLED:-true}"
 
-log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [dispatch] $1"; }
+# v3.16: printf %()T, not $(date): see §8.2.
+log() { printf '%(%Y-%m-%d %H:%M:%S)T [dispatch] %s\n' -1 "$1"; }
 
 # v3.16: shared helpers (§8.11) — wait_child.
 . "$(dirname "${BASH_SOURCE[0]}")/nas-sync-lib.sh" || { log "ERROR: nas-sync-lib.sh not found (§8.11)"; exit 1; }
@@ -1819,10 +1870,16 @@ ISTIO_ADMIN_PORT="${ISTIO_ADMIN_PORT:-15020}"
 SIDECAR_QUIT_ENABLED="${SIDECAR_QUIT_ENABLED:-true}"
 SIDECAR_QUIT_TIMEOUT="${SIDECAR_QUIT_TIMEOUT:-10}"
 
-log() { echo "$(date '+%Y-%m-%d %H:%M:%S') [wrapper] $1"; }
+# v3.16: printf %()T, not $(date): see §8.2.
+log() { printf '%(%Y-%m-%d %H:%M:%S)T [wrapper] %s\n' -1 "$1"; }
 
-# v3.16: shared helpers (§8.11) — wait_child.
-. "$(dirname "${BASH_SOURCE[0]}")/nas-sync-lib.sh" || { log "ERROR: nas-sync-lib.sh not found (§8.11)"; exit 1; }
+# v3.16: shared helpers (§8.11) — wait_child. A missing library must NOT end this wrapper before
+# the sidecar quit below: istio-proxy would run on, and the Job pod would hang NotReady instead of
+# failing and being retried. The dispatcher needs the same library and exits 1 at once, so the sync
+# cannot run and a plain `wait` is all this shell needs from wait_child.
+. "$(dirname "${BASH_SOURCE[0]}")/nas-sync-lib.sh" \
+    || { log "ERROR: nas-sync-lib.sh not found (§8.11) — the sync cannot run; still quitting the sidecar"
+         wait_child() { wait "$1"; WAIT_RC=$?; }; }
 
 log "=== Wrapper start (SYNC_MODE=${SYNC_MODE:-standard}) ==="
 
@@ -1851,6 +1908,10 @@ if [ -n "$GOT_TERM" ]; then
     log "=== Interrupted: exit $SYNC_EXIT ==="
     exit "$SYNC_EXIT"
 fi
+
+# The sync is over: from here a TERM must not re-enter on_term, whose group `kill -TERM 0` would
+# also hit the curl/nc/pilot-agent below. Default action instead: the pod is being deleted anyway.
+trap - TERM INT
 
 if [ "$SIDECAR_QUIT_ENABLED" != "true" ]; then
     exit $SYNC_EXIT
@@ -1909,6 +1970,7 @@ exit $SYNC_EXIT
 # Deployment entry — initial sync + cron loop
 # Sidecar NOT quit (pod runs forever)
 #############################################
+# log() still forks date on purpose: the behavior suite parks this script inside that call (a test hook), and the bash 5.2 abort that made the other scripts use printf %()T (§8.2) did not reproduce here (25,000 TERMs).
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"; }
 
 # v3.16: shared helpers (§8.11) — wait_child.
@@ -2003,6 +2065,9 @@ INIT_PID=$!
 # The sync is a background job of this shell, so it is in OUR process group: `kill -TERM 0`
 # reaches it even if flock has not exec'd yet and `ps` cannot see it (the §8.6 wrapper's trap
 # signals its own group the same way).
+# This group is not added to SIGNALLED (signal_runs records only the TERMs it sends itself), so the
+# drain may TERM it once more. Harmless: this TERM reaches the new dispatcher before it has installed
+# its handler and kills it at birth, so no run is left for a second TERM to hit (measured: none seen).
 [ -n "$GOT_TERM" ] && kill -TERM 0 2>/dev/null
 wait_child "$INIT_PID"
 [ -n "$GOT_TERM" ] && drain_and_exit
@@ -2083,9 +2148,10 @@ COPY nas-sync-lib.sh            /userapp/scripts/
 RUN dos2unix /userapp/scripts/*.sh \
     && chmod +x /userapp/scripts/*.sh
 
-# Fail build if any CRLF remains in any script
+# Fail build if any CRLF remains in any script. RUN uses /bin/sh (dash), where $'\r' is not a
+# carriage return (v3.12-v3.15 grepped for the literal text and never fired): count CR bytes with tr.
 RUN for f in /userapp/scripts/*.sh; do \
-        if head -1 "$f" | grep -q $'\r'; then \
+        if [ "$(tr -cd '\r' < "$f" | wc -c)" -ne 0 ]; then \
             echo "ERROR: CRLF detected in $f" && exit 1; \
         fi; \
     done && echo "All scripts verified LF-clean"
@@ -2185,11 +2251,14 @@ WORK_DIR="/tmp/nas-sync-verify.$$"
 
 # v3.16: folder names are raw bytes, not characters. bash 5.2 `read -d ''` under a UTF-8 locale
 # silently loses the record after a name that ends in a UTF-8 lead byte (legacy Big5/MS950 names
-# often do). C is also the image's default locale, so this only makes it explicit.
+# often do). C is also the image's default locale, so this mostly makes it explicit. It also
+# overrides a LANG/LC_ALL the deployer sets, so the log shows non-ASCII folder names as octal
+# escapes (rsync \#344, bash $'\344'); the data is unaffected.
 export LC_ALL=C
 
-log() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"; }
-log_error() { echo "$(date '+%Y-%m-%d %H:%M:%S') - ERROR: $1" >&2; }
+# v3.16: printf %()T, not $(date): see §8.2.
+log() { printf '%(%Y-%m-%d %H:%M:%S)T - %s\n' -1 "$1"; }
+log_error() { printf '%(%Y-%m-%d %H:%M:%S)T - ERROR: %s\n' -1 "$1" >&2; }
 die() { log_error "$1"; exit "${2:-1}"; }
 
 # v3.16: shared helpers (§8.11). On SIGTERM, let rsync finish, then stop.
@@ -2262,7 +2331,13 @@ if [ "$VERIFY_MODE" = "checksum" ] || [ "$VERIFY_MODE" = "both" ]; then
     list_top_dirs > "${WORK_DIR}/topdirs.bin"
     LIST_RC=$?
     check_term
-    [ "$LIST_RC" -eq 0 ] || die "Tier 2: cannot list top-level dirs (rsync rc=$LIST_RC)" "$LIST_RC"
+    # Same tolerance as tier 1 and the per-dir loop below: rc 24 (an entry vanished) is normal on a
+    # live source; rc 23 is a warning.
+    case "$LIST_RC" in
+        0|24) ;;
+        23)   log "WARN: rc=23 listing top-level dirs (some entries unreadable) — checking the ones that were listed" ;;
+        *)    die "Tier 2: cannot list top-level dirs (rsync rc=$LIST_RC)" "$LIST_RC" ;;
+    esac
 
     # An empty slice is legitimate; an empty top-level list is not (cf. "No folders found", §8.3).
     NTOP_NUL=$(tr -cd '\0' < "${WORK_DIR}/topdirs.bin" | wc -c | tr -d ' ')
@@ -2360,8 +2435,10 @@ exit 0
 #                      queued workers see the stop request (§8.3)
 #   check_term         exit 143 once SIGTERM has arrived
 # Caller provides: log(); for list_top_dirs also
-# REMOTE_URL, RSYNC_PASSWORD_FILE, EXCLUDE_FILE;
-# optionally STOP_FILE (a path) for term_trap_install.
+# REMOTE_URL, RSYNC_PASSWORD_FILE, EXCLUDE_FILE
+# and optionally RSYNC_LIST_TIMEOUT (idle seconds,
+# default 300); optionally STOP_FILE (a path) for
+# term_trap_install.
 #############################################
 
 # Top-level directory names of the remote module, each terminated by NUL, on stdout.
@@ -2373,7 +2450,7 @@ exit 0
 # filtered with identical semantics (names given explicitly to --files-from bypass excludes).
 list_top_dirs() {
     local out rc
-    local args=(--list-only -8 --password-file="$RSYNC_PASSWORD_FILE")
+    local args=(--list-only -8 --timeout="${RSYNC_LIST_TIMEOUT:-300}" --password-file="$RSYNC_PASSWORD_FILE")
     [ -f "$EXCLUDE_FILE" ] && args+=(--exclude-from="$EXCLUDE_FILE")
     out=$(mktemp) || return 1
     rsync "${args[@]}" "${REMOTE_URL}/" > "$out"

@@ -428,6 +428,35 @@ EOF
         check "VERIFY_SLICES=$sl: verify fails with 'not a positive integer' instead of skipping tier 2 and saying VERIFY OK (rc=$RC)" \
             '[ "$RC" -ne 0 ] && grep -q "VERIFY_SLICES=.$sl. is not a positive integer" "$T/verify-slices-$sl.log" && ! grep -q "VERIFY OK" "$T/verify-slices-$sl.log"'
     done
+    # The other settings that decide what verify compares are checked up front too, before tier 1 runs for hours:
+    # an unknown VERIFY_MODE ran no tier and said VERIFY OK; a non-numeric VERIFY_FAIL_THRESHOLD turned the final
+    # comparison into an error (false), so real drift also ended in VERIFY OK.
+    LOCAL_NAS_PATH="$DST8" VERIFY_MODE=Both VERIFY_SLICES=1 timeout --kill-after=10 300 "$S/nas-sync-verify.sh" > "$T/verify-mode-bad.log" 2>&1
+    RC=$?
+    check "VERIFY_MODE=Both: verify fails ('is not meta, checksum or both') instead of running no tier and saying VERIFY OK (rc=$RC)" \
+        '[ "$RC" -ne 0 ] && grep -q "VERIFY_MODE=.Both. is not meta, checksum or both" "$T/verify-mode-bad.log" && ! grep -q "VERIFY OK" "$T/verify-mode-bad.log"'
+    LOCAL_NAS_PATH="$DST8" VERIFY_MODE=meta VERIFY_FAIL_THRESHOLD=abc timeout --kill-after=10 300 "$S/nas-sync-verify.sh" > "$T/verify-thr-bad.log" 2>&1
+    RC=$?
+    check "VERIFY_FAIL_THRESHOLD=abc: verify fails ('not a non-negative integer') instead of saying VERIFY OK (rc=$RC)" \
+        '[ "$RC" -ne 0 ] && grep -q "VERIFY_FAIL_THRESHOLD=.abc. is not a non-negative integer" "$T/verify-thr-bad.log" && ! grep -q "VERIFY OK" "$T/verify-thr-bad.log"'
+    LOCAL_NAS_PATH="$DST8" VERIFY_MODE=both VERIFY_SLICES=abc timeout --kill-after=10 300 "$S/nas-sync-verify.sh" > "$T/verify-both-slices-bad.log" 2>&1
+    RC=$?
+    check "VERIFY_MODE=both with VERIFY_SLICES=abc fails before tier 1 starts (rc=$RC)" \
+        '[ "$RC" -ne 0 ] && grep -q "VERIFY_SLICES=.abc. is not a positive integer" "$T/verify-both-slices-bad.log" && ! grep -q "Tier 1:" "$T/verify-both-slices-bad.log"'
+    # Tier 2 tolerates rc 23 only when rsync explains it with a "vanished" line. An rc 23 that carries only the
+    # summary line ("rsync error: … (code 23)") explains nothing and must fail. The shim does that for the
+    # per-folder checksum pass only.
+    mkdir -p "$T/shim-ck23"
+    printf '#!/bin/bash
+case " $* " in *" --list-only "*) exec %s "$@";; *" --checksum "*) %s "$@"; echo "rsync error: some files/attrs were not transferred (see previous errors) (code 23) at main.c(1338) [generator=3.2.7]" >&2; exit 23;; esac
+exec %s "$@"
+' \
+        "$REAL_RSYNC" "$REAL_RSYNC" "$REAL_RSYNC" > "$T/shim-ck23/rsync"
+    chmod +x "$T/shim-ck23/rsync"
+    PATH="$T/shim-ck23:$PATH" LOCAL_NAS_PATH="$DST8" VERIFY_MODE=checksum VERIFY_SLICES=1 timeout --kill-after=10 300 "$S/nas-sync-verify.sh" > "$T/verify-ck23-bare.log" 2>&1
+    RC=$?
+    check "verify tier 2: an rc 23 with no 'vanished' line fails (exit 23), it is not tolerated as a removed folder (rc=$RC)" \
+        '[ "$RC" -eq 23 ] && ! grep -q "VERIFY OK" "$T/verify-ck23-bare.log" && ! grep -q "removed between listing and checking" "$T/verify-ck23-bare.log"'
 
     # A daemon that accepts the connection and never answers: the chunk-list fetch and the top-level listing
     # must give up after RSYNC_LIST_TIMEOUT (rsync --timeout) instead of hanging until the Job deadline.

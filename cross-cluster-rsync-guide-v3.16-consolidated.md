@@ -2335,6 +2335,20 @@ wait_for_remote || die "Remote not reachable after ${PREFLIGHT_RETRIES} attempts
 timeout 10 mountpoint -q "$LOCAL_NAS_PATH" 2>/dev/null || die "Local NAS not mounted"
 log "OK Pre-flight"
 
+# Validate what decides which tiers run before any of them starts: a typo must not end in
+# VERIFY OK with nothing compared, and a bad VERIFY_SLICES must not surface only after hours of
+# tier 1. Read as decimal: $(( )) reads a leading zero as octal (08 was an error, 010 meant 8).
+case "$VERIFY_MODE" in meta|checksum|both) ;; *) die "VERIFY_MODE='${VERIFY_MODE}' is not meta, checksum or both" ;; esac
+if [ "$VERIFY_MODE" != "meta" ]; then      # only tier 2 reads VERIFY_SLICES
+    case "$VERIFY_SLICES" in ''|*[!0-9]*) die "VERIFY_SLICES='${VERIFY_SLICES}' is not a positive integer" ;; esac
+    [ "$VERIFY_SLICES" -ge 1 ] 2>/dev/null || die "VERIFY_SLICES='${VERIFY_SLICES}' is not a positive integer"
+    VERIFY_SLICES=$((10#$VERIFY_SLICES))
+fi
+# A threshold that is not a number made the final `-gt` test an error, i.e. false: real drift
+# then ended in "VERIFY OK".
+case "$VERIFY_FAIL_THRESHOLD" in ''|*[!0-9]*) die "VERIFY_FAIL_THRESHOLD='${VERIFY_FAIL_THRESHOLD}' is not a non-negative integer" ;; esac
+VERIFY_FAIL_THRESHOLD=$((10#$VERIFY_FAIL_THRESHOLD))
+
 # Count itemized lines that represent a real difference. rsync --itemize-changes emits
 # 11-char change flags; '>' = would transfer, 'c' = would create. '.' lines are matches.
 count_drift() { grep -cE '^(>|c)' "$1"; }
@@ -2367,12 +2381,6 @@ fi
 
 # ---- Tier 2: checksum verify over a deterministic rotating slice ----
 if [ "$VERIFY_MODE" = "checksum" ] || [ "$VERIFY_MODE" = "both" ]; then
-    # A positive integer, read as decimal: $(( )) below reads a leading zero as octal, so a plain
-    # VERIFY_SLICES=08 was an arithmetic error that skipped this whole tier and still ended in
-    # "VERIFY OK", and 010 meant 8. Anything else (abc, 0) was the same silent skip.
-    case "$VERIFY_SLICES" in ''|*[!0-9]*) die "VERIFY_SLICES='${VERIFY_SLICES}' is not a positive integer" ;; esac
-    [ "$VERIFY_SLICES" -ge 1 ] 2>/dev/null || die "VERIFY_SLICES='${VERIFY_SLICES}' is not a positive integer"
-    VERIFY_SLICES=$((10#$VERIFY_SLICES))
     WEEK=$(date +%V); WEEK=$((10#$WEEK))
     SLICE=$(( WEEK % VERIFY_SLICES ))
     log "Tier 2: checksum verify, slice $SLICE of $VERIFY_SLICES (week $WEEK)..."
@@ -2428,10 +2436,11 @@ if [ "$VERIFY_MODE" = "checksum" ] || [ "$VERIFY_MODE" = "both" ]; then
                   # error: Connection reset" line). Any other rc 23 (opendir or readlink failed:
                   # permission denied, I/O error) means part of the folder was NOT compared, and
                   # drift=0 would be false assurance.
-                  if grep -v -e '^rsync error: ' \
-                             -e 'link_stat .* failed: No such file or directory' \
-                             -e 'Receiver\] read error: Connection reset' \
-                             "${WORK_DIR}/ck.err" | grep -q .; then
+                  if ! grep -q 'link_stat .* failed: No such file or directory' "${WORK_DIR}/ck.err" \
+                      || grep -v -e '^rsync error: ' \
+                                 -e 'link_stat .* failed: No such file or directory' \
+                                 -e 'Receiver\] read error: Connection reset' \
+                                 "${WORK_DIR}/ck.err" | grep -q .; then
                       log_error "rc=23 checking $(printf '%q' "$d"): part of it could not be read, so it was not byte-checked"
                       sed -n '1,20p' "${WORK_DIR}/ck.err" >&2
                       die "verify aborted" 23

@@ -2435,7 +2435,8 @@ check_term() {
 > **Shutdown model (v3.16).** One place sends SIGTERM; every shell that has children waits
 > for them. The CronJob wrapper (§8.6) signals its own process group; the Deployment
 > entrypoint (§8.7) signals each run's process group (cron gives every job its own session).
-> The dispatcher (§8.5) and the mode scripts only wait, so rsync — which handles SIGTERM
+> The dispatcher (§8.5) passes the TERM on to the mode script and waits; the mode scripts
+> record it and wait, so rsync — which handles SIGTERM
 > itself — moves its partial file into `.rsync-partial/` before anything exits, and the status
 > file records `interrupted=TERM`. In v3.15 the wrapper died first, tini (PID 1) exited, and
 > the kernel SIGKILLed rsync, leaving a `.<name>.XXXXXX` temp file in the target tree that no

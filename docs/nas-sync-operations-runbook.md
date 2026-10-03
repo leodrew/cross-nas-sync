@@ -147,7 +147,8 @@ kubectl --context cluster-b create job --from=cronjob/nas-sync-manifest bootstra
 kubectl --context cluster-b wait --for=condition=complete job/bootstrap -n ea-pmc --timeout=7200s
 kubectl --context cluster-b logs job/bootstrap -n ea-pmc
 # Pod log "lock 'manifests' held by [...]" (exit 75)? A scheduled run is already walking. The Job
-# retries by itself; if it ends Failed, wait for that run, delete the Job and re-run. "cannot determine
+# retries by itself; if it ends Failed, wait for that run, delete the Job and re-run. kubectl wait does
+# not stop on a Failed Job: Ctrl-C it and check "kubectl get job bootstrap". "cannot determine
 # the age of lock" (also 75) = unhealthy source NAS. Both: guide §13 "Generator Job Failed".
 ```
 
@@ -242,6 +243,8 @@ kubectl --context cluster-b create job --from=cronjob/nas-sync-chunks seed-chunk
 kubectl --context cluster-b wait --for=condition=complete job/seed-chunks -n ea-pmc --timeout=14400s
 # Pod log "lock 'chunks' held by [...]" (exit 75)? Another chunk run is walking, and its chunks serve
 # the bulk seed just as well: the Job retries once, then shows Failed — wait for that run instead.
+# kubectl wait does not stop on a Failed Job: Ctrl-C it after a minute or two and check
+# "kubectl get job seed-chunks".
 # "cannot determine the age of lock" (also 75) = unhealthy source NAS. Guide §13 "Generator Job Failed".
 ```
 
@@ -344,7 +347,8 @@ kubectl --context cluster-b create job --from=cronjob/nas-sync-manifest reg-nas-
 kubectl --context cluster-b wait --for=condition=complete job/reg-nas-c -n ea-pmc --timeout=7200s
 #    Pod log "lock 'manifests' held by [...]" (exit 75)? A run that started before your edit is walking;
 #    its manifests will not include nas-c. The Job retries by itself (a retry reads the new registry); if
-#    it ends Failed, wait for that run, delete the Job, re-run. "cannot determine the age of lock" = unhealthy NAS (§13).
+#    it ends Failed, wait for that run, delete the Job, re-run. kubectl wait does not stop on a Failed
+#    Job: Ctrl-C it and check "kubectl get job reg-nas-c". "cannot determine the age of lock" = unhealthy NAS (§13).
 kubectl --context cluster-b exec deployment/nas-sync-server -n ea-pmc -c nas-sync-server -- \
   ls -la /mnt/nas-source/.nas-sync-state/clients/nas-c/
 
@@ -613,7 +617,8 @@ Recover by fixing the cause and forcing a run:
 ```bash
 kubectl --context cluster-b create job --from=cronjob/nas-sync-manifest recover -n ea-pmc
 # Pod log "lock '…' held by […]" (exit 75)? A run holds the lock; the Job retries by itself, and if it ends
-# Failed, let that run finish and re-run. A killed run's lock is broken once its heartbeat is 600s old.
+# Failed, let that run finish, delete the Job (kubectl delete job recover) and re-run. A killed run's
+# lock is broken once its heartbeat is older than 600s.
 # "cannot determine the age of lock" (also 75) = unhealthy source NAS: fix it first (guide §13).
 ```
 

@@ -654,7 +654,9 @@ lock_acquire() {
     _lock_posint "$LOCK_STALE"     || { log "WARN: LOCK_STALE='${LOCK_STALE}' is not a positive integer — using 600"; LOCK_STALE=600; }
     # A live holder's heartbeat is up to LOCK_HEARTBEAT old, so LOCK_STALE below 2 x LOCK_HEARTBEAT
     # lets a contender break a live lock. (LOCK_STALE/2 rather than 2*LOCK_HEARTBEAT: no overflow.)
-    if [ $(( LOCK_STALE / 2 )) -lt "$LOCK_HEARTBEAT" ]; then
+    # 10#: $(( )) reads a leading zero as octal, so a plain LOCK_STALE=08 is an arithmetic error that
+    # abandons lock_acquire and lets the job run WITHOUT the lock, and 0120 would be read as 80.
+    if [ $(( 10#$LOCK_STALE / 2 )) -lt "$LOCK_HEARTBEAT" ]; then
         log "WARN: LOCK_STALE=${LOCK_STALE} must be at least 2 x LOCK_HEARTBEAT=${LOCK_HEARTBEAT} — using 600 and 60"
         LOCK_STALE=600; LOCK_HEARTBEAT=60
     fi
@@ -704,9 +706,14 @@ lock_acquire() {
             # We moved a FRESH lock that another run took after breaking the stale one: put it back.
             if ! mv -T "$stale_dir" "$LOCK_PATH" 2>/dev/null; then
                 # A third run took the name meanwhile, so the lock cannot go back. Remove it rather than
-                # strand it as a *.lock.stale.* dir that no run ever cleans up.
-                log "WARN: could not restore lock '${name}' moved by mistake"
-                [ -d "$LOCK_PATH" ] && rm -rf "$stale_dir"
+                # strand it as a *.lock.stale.* dir that no run ever cleans up. (If nothing holds the name
+                # the restore failed for another reason: keep the dir for inspection.)
+                if [ -d "$LOCK_PATH" ]; then
+                    rm -rf "$stale_dir"
+                    log "WARN: could not restore lock '${name}' moved by mistake: another run holds the name, so the displaced copy was removed"
+                else
+                    log "WARN: could not restore lock '${name}' moved by mistake and nothing holds the name: the displaced copy is kept as ${stale_dir}"
+                fi
             fi
             log "ERROR: another run broke lock '${name}' first; this run did nothing"
             exit "$LOCK_EXIT_HELD"
@@ -1515,8 +1522,14 @@ else
     list_top_dirs > "$NAMES_BIN"
     LIST_RC=$?
     check_term
-    # rc 24 (an entry vanished during the listing) is normal on a live source, like everywhere else.
-    rsync_rc_ok "$LIST_RC" || die "Cannot list top-level folders (rsync rc=$LIST_RC)"
+    # Only rc 0 and 24 are accepted. rc 24 (an entry vanished during the listing) is normal on a live
+    # source and safe here: that entry no longer exists, so no folder is missed. rc 23 is NOT: an entry
+    # that still exists could not be read, so it is missing from the list and no worker would ever sync
+    # it. So not rsync_rc_ok (it maps 23 to success, right for the transfers, wrong for a list).
+    case "$LIST_RC" in
+        0|24) ;;
+        *)    die "Cannot list top-level folders (rsync rc=$LIST_RC)" ;;
+    esac
     UNIT_COUNT=$(tr -cd '\0' < "$NAMES_BIN" | wc -c | tr -d ' ')
     log "Found $UNIT_COUNT top-level folders"
     [ "$UNIT_COUNT" -gt 0 ] || die "No folders found"
@@ -1910,8 +1923,10 @@ if [ -n "$GOT_TERM" ]; then
 fi
 
 # The sync is over: from here a TERM must not re-enter on_term, whose group `kill -TERM 0` would
-# also hit the curl/nc/pilot-agent below. Default action instead: the pod is being deleted anyway.
-trap - TERM INT
+# also hit the curl/nc/pilot-agent below. The pod is being deleted anyway, so just end, with the
+# sync's own status: the default action would report a finished, successful sync as 143 (a Failed
+# pod). The trap runs when the foreground curl/nc returns (at once under `tini -g`: it got the TERM too).
+trap 'exit "$SYNC_EXIT"' TERM INT
 
 if [ "$SIDECAR_QUIT_ENABLED" != "true" ]; then
     exit $SYNC_EXIT
@@ -1970,7 +1985,9 @@ exit $SYNC_EXIT
 # Deployment entry — initial sync + cron loop
 # Sidecar NOT quit (pod runs forever)
 #############################################
-# log() still forks date on purpose: the behavior suite parks this script inside that call (a test hook), and the bash 5.2 abort that made the other scripts use printf %()T (§8.2) did not reproduce here (25,000 TERMs).
+# log() still forks date on purpose: the behavior suite parks this script inside that call (a test
+# hook). The bash 5.2 abort that made the other scripts use printf %()T (§8.2) was not reproduced
+# here (25,000 injected TERMs).
 log() { echo "$(date '+%Y-%m-%d %H:%M:%S') - $1"; }
 
 # v3.16: shared helpers (§8.11) — wait_child.
@@ -2067,7 +2084,7 @@ INIT_PID=$!
 # signals its own group the same way).
 # This group is not added to SIGNALLED (signal_runs records only the TERMs it sends itself), so the
 # drain may TERM it once more. Harmless: this TERM reaches the new dispatcher before it has installed
-# its handler and kills it at birth, so no run is left for a second TERM to hit (measured: none seen).
+# its handler, so it dies at birth and no second TERM ever reaches an rsync.
 [ -n "$GOT_TERM" ] && kill -TERM 0 2>/dev/null
 wait_child "$INIT_PID"
 [ -n "$GOT_TERM" ] && drain_and_exit
@@ -2331,11 +2348,11 @@ if [ "$VERIFY_MODE" = "checksum" ] || [ "$VERIFY_MODE" = "both" ]; then
     list_top_dirs > "${WORK_DIR}/topdirs.bin"
     LIST_RC=$?
     check_term
-    # Same tolerance as tier 1 and the per-dir loop below: rc 24 (an entry vanished) is normal on a
-    # live source; rc 23 is a warning.
+    # Only rc 0 and 24 are accepted. rc 24 (an entry vanished) is normal on a live source and safe: it
+    # no longer exists. rc 23 is not: an unreadable entry would be missing from the list, so that
+    # folder would never be byte-checked and the run could report drift=0 over a short list.
     case "$LIST_RC" in
         0|24) ;;
-        23)   log "WARN: rc=23 listing top-level dirs (some entries unreadable) — checking the ones that were listed" ;;
         *)    die "Tier 2: cannot list top-level dirs (rsync rc=$LIST_RC)" "$LIST_RC" ;;
     esac
 

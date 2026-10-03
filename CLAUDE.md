@@ -8,11 +8,13 @@ This directory is a **documentation reference**, not a buildable project. It con
 
 | File | Contents |
 |------|----------|
-| `cross-cluster-rsync-guide-v3.15-consolidated.md` | **Authoritative reference.** Every script, Dockerfile, and K8s/Istio manifest for both clusters, plus verify/troubleshooting steps. Consolidates v3.4–v3.14 and adds the v3.15 hardening + defect fixes. |
+| `cross-cluster-rsync-guide-v3.16-consolidated.md` | **Authoritative reference.** Every script, Dockerfile, and K8s/Istio manifest for both clusters, plus verify/troubleshooting steps. Consolidates v3.4–v3.15 and adds the v3.16 fixes (chunk generations, generator lock, any-character folder names, graceful SIGTERM). |
 | `docs/nas-sync-operations-runbook.md` | **Operator procedures.** Scenario-driven (S0–S14): greenfield, bulk seed, onboarding a target while others are live, outage recovery, retirement, upgrade, triage, tuning. Cross-links into the guide's § numbers. |
 | `docs/reviews/2026-07-22-nas-sync-architecture-review.md` | **Why the design is what it is.** Architecture verdict, alternatives, the limits of mtime-based change detection, and all 16 findings fixed in v3.15. |
 | `scripts/check-guide.sh` | Consistency harness for the guide. **Run before every commit that touches a guide.** |
-| `cross-cluster-rsync-guide-v3.14-consolidated.md`, `...v3.13...` | History. Do not edit; do not deploy from. |
+| `scripts/test-guide-behavior.sh` | Runtime suite: extracts the guide's scripts and runs them against a real rsync daemon (tini as PID 1, cron). **Run before every commit that changes a script block.** |
+| `docs/superpowers/specs/2026-10-01-v316-review-fixes-design.md` | **Why v3.16 changed what it changed.** Every finding with its reproduction, and the design of each fix. |
+| `cross-cluster-rsync-guide-v3.15-consolidated.md`, `...v3.14...`, `...v3.13...` | History. Do not edit; do not deploy from. |
 
 The version is encoded in the filename. `§14 → What This Consolidates` maps each capability to the version it originated in — treat that table as the changelog.
 
@@ -69,25 +71,35 @@ These are the constraints that explain why the scripts/manifests look the way th
 - **rsync exit codes 23 and 24 are normal** on a live source (files vanish mid-run). All mode scripts map them to success via `rsync_rc_ok()`. Do not "fix" this by propagating them.
 - **`--partial-dir=.rsync-partial`, not bare `--partial`.** Bare `--partial` leaves truncated files at their real names on the target, where readers see corrupt data.
 - ConfigMaps/Secrets are mounted via `subPath` (single-file mounts) so they don't clobber the directory; read-only mounts are never `chmod`-ed.
+- **One place signals; every parent waits.** The CronJob wrapper (`§8.6`) sends one SIGTERM to its own process group; the Deployment entrypoint (`§8.7`) sends one to each in-flight run's process group, runs that start during the drain included — each group is told exactly once, because a second TERM can make rsync skip saving its partial file. The dispatcher passes a TERM on to the mode script and waits; the mode scripts record it and wait for rsync, which handles SIGTERM itself (`§8.11`). If any shell exits before its children, tini (PID 1) exits and the kernel SIGKILLs rsync mid-file, leaving a `.<name>.XXXXXX` temp file that no run ever removes. Never `exec` the mode script from the dispatcher (the status write must run after it), and never `exec cron` in the Deployment entrypoint (cron jobs live in their own sessions, out of reach of `tini -g`).
+- **Chunk files are named by generation** (`chunk-<gen>-NNN.txt`). rsync re-resolves each file by path while sending, so a fetch that overlaps the server's swap would otherwise mix two generations with rc=0. Never go back to fixed chunk names.
+- **Generators are serialized by an NFS `mkdir` lock with a heartbeat** (`§4.7`), not by `concurrencyPolicy: Forbid` (which manual `create job --from` runs bypass) and not by `flock` (node-local on a `nolock` mount). A run that finds the lock held, cannot read its age (it fails closed: NAS full, over quota, read-only or a stale mount), or loses a race to break a stale lock exits 75 and does nothing. A lock whose heartbeat (every `LOCK_HEARTBEAT`, 60s) is older than `LOCK_STALE` (600s) belongs to a dead run, and the next run breaks it.
+- **Top-level folder names go through `--files-from --from0`, never into a remote path.** The rsync daemon glob-expands remote paths (`a[1]/` is served from `a1/`), `--list-only` escapes non-ASCII as `\#ooo` unless `-8`, and names may contain spaces, quotes or newlines. `list_top_dirs` (`§8.11`) is the only parser — do not reintroduce `awk '{print $NF}'`.
+- **`-a` implies `-r`** (except under `--files-from`, where `-r` must be explicit — `§8.3`). Any "top level only" rsync needs `--no-recursive --dirs`; `-a --dirs` silently copies the whole tree.
 
 ## "Commands" in this repo
 
-There is nothing to build or test locally, with one exception: **the guide checker**.
+There is nothing to build locally. There are two test suites: **the guide checker** (static) and **the behavior suite** (runtime).
 
 ```bash
 # ALWAYS run after editing a guide — this is the repo's test suite
 bash scripts/check-guide.sh                      # newest guide
 bash scripts/check-guide.sh <guide.md>           # a specific one
+
+# ALWAYS run after changing a script block — runs the scripts against a real rsync daemon
+bash scripts/test-guide-behavior.sh              # in docker (default; works from Windows)
+bash scripts/test-guide-behavior.sh --slow       # + the Deployment/cron case (~2-3 min more)
+bash scripts/test-guide-behavior.sh --native     # disposable Linux container/CI only (needs root; --slow also needs cron and cc)
 ```
 
-It verifies: CR bytes, `bash -n` on every fenced bash block, YAML parse on every fenced yaml block, absence of `--delete`, placeholder integrity, that every `§ref` resolves to a real heading, that every defined file appears in the §14 checklist, and that each v3.15 defect fix is still present. Needs `pyyaml` for full YAML parsing (`pip install pyyaml`); degrades to a structural check without it.
+It verifies: CR bytes, `bash -n` on every fenced bash block, YAML parse on every fenced yaml block, absence of `--delete`, placeholder integrity, that every `§ref` resolves to a real heading, that every defined file appears in the §14 checklist, and that each v3.15 and v3.16 defect fix is still present. Needs `pyyaml` for full YAML parsing (`pip install pyyaml`); degrades to a structural check without it.
 
 The operational commands live in the guide and target real clusters:
 
 ```bash
 # Build & push images (run once per cluster, from the scripts/ dir; strip CRLF first)
-docker build -t ${REGISTRY}/nas-sync-server:3.15 .   # Cluster B (§4.5)
-docker build -t ${REGISTRY}/nas-sync-client:3.15 .   # Cluster A (§8.9)
+docker build -t ${REGISTRY}/nas-sync-server:3.16 .   # Cluster B (§4.5)
+docker build -t ${REGISTRY}/nas-sync-client:3.16 .   # Cluster A (§8.9)
 
 # Deploy order (see §14 → Deploy Order): server+GW → (manifest/chunk jobs) → verify → client → reconcile → verify job
 kubectl apply -f cluster-b/...        # then cluster-a/...
@@ -113,3 +125,4 @@ The document is heavily self-referential. If you add or move content, keep these
 - Any change to a script or manifest must remain copy-paste-ready (valid shell/YAML, LF line endings, placeholders like `your-registry.example.com` and `ISTIO_EXTERNAL_IP_HERE` left intact and marked `◄ MODIFY`).
 - **Never add `--delete`** in any form. Target-only files are preserved by policy; the orphan copies this leaves after a rename are a known, accepted cost (§12.1).
 - **Run `bash scripts/check-guide.sh` before committing.** It catches every item above.
+- **Run `bash scripts/test-guide-behavior.sh` when a script block changes.** Every case fails on v3.15 by design (that proves the suite detects the defects); on the current guide every case must pass. A skipped sub-case (a missing tool, such as `cc` for one `deploy` sub-case) is reported and exits 0, but exits 2 when you asked for that case with `--case` (`--case deploy` without `cc`).

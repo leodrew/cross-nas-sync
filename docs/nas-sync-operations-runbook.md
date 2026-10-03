@@ -1,6 +1,6 @@
 # Cross-Cluster NAS Sync — Operations Runbook
 
-**Companion to** `cross-cluster-rsync-guide-v3.15-consolidated.md` (referred to below as
+**Companion to** `cross-cluster-rsync-guide-v3.16-consolidated.md` (referred to below as
 "the guide"). The guide is the **reference**: every file, every flag, why each exists. This
 runbook is the **procedure**: given a situation, what do you run, in what order, and how do
 you know it worked.
@@ -110,7 +110,7 @@ CronJob will fail loudly if you deploy it first.
 #    ALL scripts must be LF-only. On Windows: sed -i 's/\r$//' *.sh
 # 2. Build & push (§4.5)
 cd cluster-b/scripts
-docker build -t ${REGISTRY}/nas-sync-server:3.15 . && docker push ${REGISTRY}/nas-sync-server:3.15
+docker build -t ${REGISTRY}/nas-sync-server:3.16 . && docker push ${REGISTRY}/nas-sync-server:3.16
 
 # 3. Deploy the daemon + gateway (§5.1–§5.8)
 kubectl --context cluster-b apply -f cluster-b/namespace.yaml
@@ -146,6 +146,9 @@ kubectl --context cluster-b apply -f cluster-b/cronjob-manifests.yaml
 kubectl --context cluster-b create job --from=cronjob/nas-sync-manifest bootstrap -n ea-pmc
 kubectl --context cluster-b wait --for=condition=complete job/bootstrap -n ea-pmc --timeout=7200s
 kubectl --context cluster-b logs job/bootstrap -n ea-pmc
+# Pod log "lock 'manifests' held by [...]" (exit 75)? A scheduled run is already walking. The Job
+# retries by itself; if it ends Failed, wait for that run, delete the Job and re-run. "cannot determine
+# the age of lock" (also 75) = unhealthy source NAS. Both: guide §13 "Generator Job Failed".
 ```
 
 **Done when** a manifest exists for your client:
@@ -162,7 +165,7 @@ kubectl --context cluster-b exec deployment/nas-sync-server -n ea-pmc -c nas-syn
 # 1. Write the client scripts: §8.2–§8.7, §8.10, and the §8.8 Dockerfile. LF only.
 # 2. Build & push (§8.9)
 cd cluster-a/scripts
-docker build -t ${REGISTRY}/nas-sync-client:3.15 . && docker push ${REGISTRY}/nas-sync-client:3.15
+docker build -t ${REGISTRY}/nas-sync-client:3.16 . && docker push ${REGISTRY}/nas-sync-client:3.16
 
 # 3. Shared resources (§9A.1)
 kubectl --context cluster-a apply -f cluster-a/namespace.yaml
@@ -237,6 +240,9 @@ balanced slices instead of whole top-level folders (guide §8.3):
 ```bash
 kubectl --context cluster-b create job --from=cronjob/nas-sync-chunks seed-chunks -n ea-pmc
 kubectl --context cluster-b wait --for=condition=complete job/seed-chunks -n ea-pmc --timeout=14400s
+# Pod log "lock 'chunks' held by [...]" (exit 75)? Another chunk run is walking, and its chunks serve
+# the bulk seed just as well: the Job retries once, then shows Failed — wait for that run instead.
+# "cannot determine the age of lock" (also 75) = unhealthy source NAS. Guide §13 "Generator Job Failed".
 ```
 
 Then the bulk log should show `Using 24 server-generated chunks (age=...)`. If it says
@@ -336,6 +342,9 @@ kubectl --context cluster-b apply -f cluster-b/cronjob-manifests.yaml
 #    Confirm the next generator run picks it up:
 kubectl --context cluster-b create job --from=cronjob/nas-sync-manifest reg-nas-c -n ea-pmc
 kubectl --context cluster-b wait --for=condition=complete job/reg-nas-c -n ea-pmc --timeout=7200s
+#    Pod log "lock 'manifests' held by [...]" (exit 75)? A run that started before your edit is walking;
+#    its manifests will not include nas-c. The Job retries by itself (a retry reads the new registry); if
+#    it ends Failed, wait for that run, delete the Job, re-run. "cannot determine the age of lock" = unhealthy NAS (§13).
 kubectl --context cluster-b exec deployment/nas-sync-server -n ea-pmc -c nas-sync-server -- \
   ls -la /mnt/nas-source/.nas-sync-state/clients/nas-c/
 
@@ -420,6 +429,8 @@ kubectl exec <any-client-pod> -n ea-pmc -c nas-sync-client -- \
 ```
 
 `last-success` older than 2× the CronJob interval → investigate ([S12](#s12--triage-decision-tree)).
+`interrupted=TERM` at the end of `last-run` means the pod was stopped mid-sync (deadline,
+drain, rollout); the partial file is kept and the next run resumes it (guide §13).
 
 ---
 
@@ -601,6 +612,9 @@ Recover by fixing the cause and forcing a run:
 
 ```bash
 kubectl --context cluster-b create job --from=cronjob/nas-sync-manifest recover -n ea-pmc
+# Pod log "lock '…' held by […]" (exit 75)? A run holds the lock; the Job retries by itself, and if it ends
+# Failed, let that run finish and re-run. A killed run's lock is broken once its heartbeat is 600s old.
+# "cannot determine the age of lock" (also 75) = unhealthy source NAS: fix it first (guide §13).
 ```
 
 Then clients resume automatically. If the generator was down longer than `lookback_hours`,
@@ -652,11 +666,11 @@ Both images carry all the scripts, so an upgrade is: rebuild, push, roll.
 sed -i 's/\r$//' cluster-b/scripts/*.sh cluster-a/scripts/*.sh
 
 # 2. Build & push both images with the new tag
-cd cluster-b/scripts && docker build -t ${REGISTRY}/nas-sync-server:3.15 . && docker push ${REGISTRY}/nas-sync-server:3.15
-cd ../../cluster-a/scripts && docker build -t ${REGISTRY}/nas-sync-client:3.15 . && docker push ${REGISTRY}/nas-sync-client:3.15
+cd cluster-b/scripts && docker build -t ${REGISTRY}/nas-sync-server:3.16 . && docker push ${REGISTRY}/nas-sync-server:3.16
+cd ../../cluster-a/scripts && docker build -t ${REGISTRY}/nas-sync-client:3.16 . && docker push ${REGISTRY}/nas-sync-client:3.16
 
 # 3. Source side first — it serves every target
-kubectl --context cluster-b set image deployment/nas-sync-server nas-sync-server=${REGISTRY}/nas-sync-server:3.15 -n ea-pmc
+kubectl --context cluster-b set image deployment/nas-sync-server nas-sync-server=${REGISTRY}/nas-sync-server:3.16 -n ea-pmc
 kubectl --context cluster-b rollout status deployment/nas-sync-server -n ea-pmc
 kubectl --context cluster-b apply -f cluster-b/cronjob-manifests.yaml
 kubectl --context cluster-b apply -f cluster-b/cronjob-chunks.yaml
@@ -691,6 +705,10 @@ Nothing on the source NAS needs migrating; `common/chunks/` is created on first 
 thing you must not skip is adding `CLIENT_ID` to the Deployment (§10B.1) if it runs
 `incremental`.
 
+**Upgrading v3.15 → v3.16:** let in-flight `nas-sync-manifest` / `nas-sync-chunks` Jobs finish
+before applying the new CronJobs (a v3.15 generator takes no lock), then follow the order above.
+Details: the guide's appendix "Also required when coming from v3.15 → v3.16".
+
 ---
 
 ## S12 — Triage decision tree
@@ -713,6 +731,8 @@ kubectl exec <pod> -n ea-pmc -c nas-sync-client -- \
 | `Manifest is STALE` | Generator stopped | [S9](#s9--source-side-failure) |
 | Verify job `Failed`, `drift=N` | Real divergence | [S7](#s7--drift-check) |
 | `falling back to top-level split` | Chunks missing/stale | Harmless; guide §13 "Chunks stale" |
+| Generator Job `Failed`: `lock '…' held by […]` or `cannot determine the age of lock '…'` (exit 75) | Held: another run of the same generator is in progress. Age unknown: unhealthy source NAS (full, over quota, read-only, stale mount) | guide §13 "Generator Job Failed"; held: wait, then re-run; age unknown: fix the NAS first |
+| `last-run` ends in `interrupted=TERM` | Pod stopped mid-sync | guide §13 "Status shows interrupted=TERM" |
 | Sync succeeds but new files never appear | Renames, empty dirs, or beyond lookback | guide §12.1, then [S8](#s8--client-outage-recovery) |
 | `last-success` is old, `last-run` is recent | Runs are failing; read `exit=` | Follow that exit code |
 | Neither status file exists | No v3.15 run completed, or target not writable | Check the PVC and the export (S0) |
@@ -836,7 +856,9 @@ exposed by an rsyncd module the client can read.
 
 ## Related documents
 
-- `cross-cluster-rsync-guide-v3.15-consolidated.md` — the reference: every file and flag
+- `cross-cluster-rsync-guide-v3.16-consolidated.md` — the reference: every file and flag
+- `docs/superpowers/specs/2026-10-01-v316-review-fixes-design.md` — the v3.16 findings, evidence and fixes
+- `scripts/test-guide-behavior.sh` — runtime suite: runs the guide's scripts against a real rsync daemon
 - `docs/reviews/2026-07-22-nas-sync-architecture-review.md` — why the design is what it is,
   and every defect fixed in v3.15
 - `scripts/check-guide.sh` — consistency harness; run before committing guide edits

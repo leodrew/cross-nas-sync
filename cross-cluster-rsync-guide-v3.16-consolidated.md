@@ -1366,6 +1366,19 @@ log() { printf '%(%Y-%m-%d %H:%M:%S)T - %s\n' -1 "$1"; }
 log_error() { printf '%(%Y-%m-%d %H:%M:%S)T - ERROR: %s\n' -1 "$1" >&2; }
 die() { log_error "$1"; exit "${2:-1}"; }
 
+# v3.16: a CHUNK_MAX_AGE that is not a number made the staleness test in fetch_chunks an error,
+# i.e. false, so the guard was silently off and a stale chunk set was used. Anything but a
+# non-negative integer is a WARN and the default. Read as decimal: $(( )) reads 08 as octal.
+if case "$CHUNK_MAX_AGE" in
+       ''|*[!0-9]*) false ;;
+       *)           [ "$CHUNK_MAX_AGE" -ge 0 ] 2>/dev/null ;;     # also rejects a value beyond 64 bits
+   esac; then
+    CHUNK_MAX_AGE=$((10#$CHUNK_MAX_AGE))
+else
+    log "WARN: CHUNK_MAX_AGE='${CHUNK_MAX_AGE}' is not a non-negative integer — using 86400"
+    CHUNK_MAX_AGE=86400
+fi
+
 # v3.16: shared helpers (§8.11). On SIGTERM, let rsync save its partial, then stop.
 . "$(dirname "${BASH_SOURCE[0]}")/nas-sync-lib.sh" || die "nas-sync-lib.sh not found (§8.11)"
 term_trap_install
@@ -1683,6 +1696,19 @@ REMOTE_URL="rsync://${REMOTE_USER}@${REMOTE_HOST}:${REMOTE_PORT}/${REMOTE_MODULE
 log() { printf '%(%Y-%m-%d %H:%M:%S)T - %s\n' -1 "$1"; }
 log_error() { printf '%(%Y-%m-%d %H:%M:%S)T - ERROR: %s\n' -1 "$1" >&2; }
 die() { log_error "$1"; exit "${2:-1}"; }
+
+# v3.16: a MANIFEST_MAX_AGE that is not a number made the staleness test below an error, i.e.
+# false, so a dead generator went unnoticed. Anything but a non-negative integer is a WARN and
+# the default. Read as decimal: $(( )) reads 08 as octal.
+if case "$MANIFEST_MAX_AGE" in
+       ''|*[!0-9]*) false ;;
+       *)           [ "$MANIFEST_MAX_AGE" -ge 0 ] 2>/dev/null ;;     # also rejects a value beyond 64 bits
+   esac; then
+    MANIFEST_MAX_AGE=$((10#$MANIFEST_MAX_AGE))
+else
+    log "WARN: MANIFEST_MAX_AGE='${MANIFEST_MAX_AGE}' is not a non-negative integer — using 86400"
+    MANIFEST_MAX_AGE=86400
+fi
 
 # v3.16: shared helpers (§8.11). On SIGTERM, let rsync save its partial, then stop.
 . "$(dirname "${BASH_SOURCE[0]}")/nas-sync-lib.sh" || die "nas-sync-lib.sh not found (§8.11)"
@@ -3637,6 +3663,7 @@ Messages and causes:
 |---|---|---|
 | `No chunk lists available (rc=…)` | Chunk CronJob never ran, or `.nas-sync-state/common/chunks/` unreadable, or the fetch hit its idle timeout (`rc=30`: no data for `RSYNC_LIST_TIMEOUT`, default 300s) | Run §6.3 job; confirm the source mount is `readOnly: false`; for `rc=30` check the connection to the server (the run fell back to the top-level split) |
 | `Chunks are stale (age=… > …)` | Chunk job failed the last N weeks | List the chunk Jobs with the command in "Generator Job Failed" below (`grep nas-sync-chunks`) and read the latest one's log |
+| `WARN: CHUNK_MAX_AGE='…' is not a non-negative integer — using 86400` | The setting is not a whole number of seconds (`24h`, `1.5`, `-5`) | Correct the value where you set it (a CronJob `env` entry, §9A.2/§9A.4, or the image's `ENV`, §8.8). Until then the 24h default applies: before v3.16 a bad value silently turned the staleness check off |
 | `chunks.meta present but no chunk files` | A v3.15-format set (no generation in `chunks.meta`) lost its chunk files — the chunk job was interrupted mid-publish; a v3.16 set in that state reports `Chunk set inconsistent` | Re-run the chunk job; the next run self-heals |
 | `Chunk files vanished mid-fetch (rc=24)` | The fetch overlapped the chunk job's swap (v3.16) | Nothing — the client retries once after `CHUNK_RETRY_WAIT` (30s) and uses the new generation; if the retry fails too, the run falls back to the top-level split |
 | `Chunk set inconsistent (generation …)` | Same, caught by the generation check | Nothing if the retry succeeds (otherwise the run falls back); if it repeats weekly, the chunk job runs into the reconcile — schedule it earlier |
@@ -3661,7 +3688,9 @@ kubectl --context cluster-b logs job/<latest-manifest-job> -n ea-pmc
 Common causes: source NFS mount became read-only, the registry ConfigMap is malformed
 (`ERROR: no valid clients in registry`), or the walk now exceeds `activeDeadlineSeconds`.
 Fix the generator, then the next client run proceeds normally. `MANIFEST_MAX_AGE` (default
-86400s) tunes the tolerance.
+86400s) tunes the tolerance; it must be a whole number of seconds. Anything else logs
+`WARN: MANIFEST_MAX_AGE='…' is not a non-negative integer — using 86400` and the default applies
+(before v3.16 a bad value silently turned the guard off).
 
 ### Generator Job Failed: `lock '…' held by […]` or `cannot determine the age of lock '…'` (exit 75)
 
@@ -3842,7 +3871,7 @@ cluster-a/
 | Folder names with any character (`--files-from --from0`) | v3.16 | ✓ (§8.11, §8.3) — spaces, CJK, quotes, glob characters |
 | Verify tier 2 sees every folder and reports rsync errors | v3.16 | ✓ (§8.10) — was blind to the same names |
 | Listings and verify do not tolerate rsync rc 23 | v3.16 | ✓ (§8.3, §8.10) — an unreadable folder was missing from the list, or `drift=0` said nothing about it; rc 24 stays tolerated, and so does a folder that vanished before its tier 2 check (§13) |
-| Settings that gate a check are validated | v3.16 | ✓ (§8.10, §4.7) — `VERIFY_MODE`/`VERIFY_SLICES`/`VERIFY_FAIL_THRESHOLD` fail the run, `LOCK_*` fall back with a WARN and are read as decimal; a typo ended in `VERIFY OK` or a lock-free run |
+| Settings that gate a check are validated | v3.16 | ✓ (§8.10, §4.7, §8.3, §8.4) — `VERIFY_MODE`/`VERIFY_SLICES`/`VERIFY_FAIL_THRESHOLD` fail the run; `LOCK_*`, `CHUNK_MAX_AGE` and `MANIFEST_MAX_AGE` fall back to their defaults with a WARN and are read as decimal; a typo ended in `VERIFY OK`, a lock-free run or a silently disabled stale guard |
 | Metadata rsyncs time out (`RSYNC_LIST_TIMEOUT`, default 300s) | v3.16 | ✓ (§8.3, §8.11) — a dead connection hung the chunk fetch or the listing until the Job deadline |
 | Sync machinery never replicated by the fallback | v3.16 | ✓ (§8.11, §8.3) — `.nas-sync-state/` was copied to targets |
 | Top-level pass non-recursive | v3.16 | ✓ (§8.3) — `-a --dirs` was a full serial sync |

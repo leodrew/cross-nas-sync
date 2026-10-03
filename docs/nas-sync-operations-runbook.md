@@ -812,8 +812,8 @@ v3.14 env allow-list bug — the fix is in v3.15 §8.7 and requires the rebuilt 
 | `lookback_hours` | registry, §6.2 | Outages exceed the window ([S8](#s8--client-outage-recovery)) | Larger manifest, longer transfer each cycle |
 | `PARALLEL_WORKERS` | client env | Reconcile too slow and CPU is idle | Needs CPU limit headroom; more concurrent NAS load |
 | `CHUNK_COUNT` | §6.3 | Workers finish unevenly | More, smaller chunk files on the source NAS |
-| `CHUNK_MAX_AGE` | client env | Reconciles are staggered across the week ([S5](#s5--steady-state)) | Older chunks may miss recently added files (the reconcile still transfers them, just unbalanced) |
-| `MANIFEST_MAX_AGE` | client env | Generator legitimately runs less often than daily | Weakens the stale-generator guard |
+| `CHUNK_MAX_AGE` | client env | Reconciles are staggered across the week ([S5](#s5--steady-state)). A whole number of seconds: anything else logs a WARN and uses 86400 | Older chunks may miss recently added files (the reconcile still transfers them, just unbalanced) |
+| `MANIFEST_MAX_AGE` | client env | Generator legitimately runs less often than daily. A whole number of seconds: anything else logs a WARN and uses 86400 | Weakens the stale-generator guard |
 | `RSYNC_TIMEOUT` | client env | Large files over a slow link time out mid-transfer | A genuinely hung transfer takes longer to fail |
 | `RSYNC_LIST_TIMEOUT` | client env | The chunk-list fetch or the top-level listing hits its idle timeout on a slow link (`rc=30`; default 300s). Idle seconds, not run time | A dead connection takes longer to fail before the run falls back or stops |
 | `activeDeadlineSeconds` | CronJob spec | Jobs are killed while still making progress | A hung job occupies the slot longer |

@@ -83,7 +83,10 @@ On rc 24 or a failed check:
 - empty the local chunk dir and fetch once more;
 - if it fails again, fall back to the top-level split.
 
-A stale set falls back immediately, as in v3.15.
+A stale set falls back immediately, as in v3.15. `CHUNK_MAX_AGE` (default `86400`) is validated first: anything but a
+non-negative integer logs a WARN and uses the default, and the value is read as decimal. A non-number used to make the
+staleness test an error, which is false, so the guard was silently off. The client's `MANIFEST_MAX_AGE` (§8.4, same
+default and same rule) guards the manifest the same way.
 
 A `chunks.meta` with no `generation` line was written by a v3.15 chunk job. That is the case after a rollback to a
 v3.15 server, and also after a normal upgrade until the first v3.16 chunk run replaces the set (only that weekly job
@@ -361,6 +364,7 @@ depends on it, as the matrix below shows.
 | verify rsync rc ∉ {0, 24}, rc 23 included (tier 2 exception: the folder vanished after the listing) | verify fails | `exit` with rc + first stderr lines |
 | top-level listing (§8.3 fallback, §8.10 tier 2) ends rc ∉ {0, 24} | run fails | `Cannot list top-level folders (rsync rc=…)` / `Tier 2: cannot list top-level dirs` |
 | invalid `VERIFY_MODE`, `VERIFY_SLICES` or `VERIFY_FAIL_THRESHOLD` | verify fails before any tier | `exit 1` + `VERIFY_…='…' is not …` |
+| invalid `CHUNK_MAX_AGE` or `MANIFEST_MAX_AGE` | WARN, the default 86400 applies, the stale guard stays on | `WARN: …_MAX_AGE='…' is not a non-negative integer — using 86400` |
 | SIGTERM (any path) | rsync stops cleanly, partial kept, status written | `last-run … exit=143 interrupted=TERM` |
 | Cron run still busy at `SHUTDOWN_WAIT` | WARN, then the entrypoint exits 143: tini (PID 1) exits and the kernel kills what is left, before kubelet's grace limit | WARN line |
 
@@ -461,6 +465,7 @@ signals and PID 1. The harness turns the reproductions behind this spec into a r
 | `build` | The CRLF guard of each Dockerfile (§4.4, §8.8) really fails the build when run under `dash`, the shell of `docker build` (v3.12-v3.15's guard never fired there). |
 | `loose` | The loose-files pass copies only the top level. |
 | `swap` | A fetch overlapping the §4.6 swap ends in either a consistent single-generation set or rc≠0 → retry/fallback. Never a mix. |
+| `stale` | A 30-day-old chunk set and a 30-day-old manifest are rejected with the default guards. With `CHUNK_MAX_AGE` / `MANIFEST_MAX_AGE` set to `abc`, `1h`, `-5`, `1.5` or a value beyond 64 bits, the run logs the WARN, applies 86400 and still rejects them (before: the guard was silently off, or a negative value always tripped it). Valid values (`0086400`) log nothing, and a bad value with a fresh chunk set or manifest still uses it. |
 | `lock` | Overlapping manifest runs: the second exits 75, and the published manifest equals the solo baseline. Same for chunks. A lock whose heartbeat is older than `LOCK_STALE` is broken; one whose age cannot be measured, or whose existing heartbeat cannot be `stat`ed, is not (exit 75); one with no heartbeat file and an old directory is. `LOCK_STALE` below 2 × `LOCK_HEARTBEAT` falls back to the defaults; leading zeros (`08`, `0120`) are decimal. The heartbeat survives a failed `touch`, does not hold the job's stdout open, and stops with a SIGKILLed holder. A displaced lock is never stranded (third run, failed restore) and `_lock_sweep` removes it only when it is older than `LOCK_STALE`, scoped to the lock's name. Registry lookbacks with a leading zero are decimal (`08` = 8 h, `010` = 10 h) and a bad line is skipped without losing the others. |
 | `signal` | With tini as PID 1, the 2×2 matrix ({`-g`, no `-g`} × {standard, parallel}) leaves no orphan `.<name>.XXXXXX` temp file, saves partials, stops within 15 s (parallel: queued units are skipped, not started), and writes `interrupted=TERM`. A TERM during the pre-flight stops the run before rsync starts (loop test under `tini -g`: every run exits 143 with a valid status line). A wrapper without `nas-sync-lib.sh` still quits the sidecar; a TERM during the sidecar-quit phase keeps the sync's exit code. |
 | `deploy` (`--slow`, ~2 min) | The entrypoint shuts down cleanly during the initial sync and during a cron run, and when the TERM lands right at the start, before the initial sync is forked (10 runs; a `date` shim holds the entrypoint inside that ~2 ms window), and a cron-launched run whose rsync cleanup is stalled by an `LD_PRELOAD` still saves its partial (skipped without `cc`). |

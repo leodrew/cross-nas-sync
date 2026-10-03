@@ -16,7 +16,7 @@
 #              /userapp/scripts, /etc/cron.d/nas-sync and
 #              /etc/environment (restored afterwards) — use a disposable container or CI.
 #   --slow     add the `deploy` case (waits for two cron minute boundaries, ~2-3 min).
-#   --case X   run only case X (repeatable): names build loose swap lock signal deploy
+#   --case X   run only case X (repeatable): names build loose swap stale lock signal deploy
 #              (deploy implies --slow). An unknown X exits 2; so does a requested case
 #              that was skipped, even in part (`--case deploy` without cc), or a run in which
 #              no check ran. Without --case, a skip is reported and the exit stays 0.
@@ -26,7 +26,7 @@ set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SLOW=0; NATIVE=0; GUIDE=""; ONLY=()
-CASES="names build loose swap lock signal deploy"
+CASES="names build loose swap stale lock signal deploy"
 ARGS=("$@")
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -555,6 +555,70 @@ if want swap; then
     check "reconcile covers every path despite the mid-fetch swap (missing=$MISSING, rc=$RC)" '[ "$MISSING" -eq 0 ] && [ "$RC" -eq 0 ]'
     check "client never accepted a mixed set (retried or used one generation)" \
         'grep -qE "retrying once|Using [0-9]+ server-generated chunks \(generation=g[0-9]+" "$T/swap.log"'
+fi
+
+# ================================================================ stale
+if want stale; then
+    head2 "stale — a bad MANIFEST_MAX_AGE / CHUNK_MAX_AGE must not switch the stale guards off (§8.3, §8.4)"
+    fresh_src
+    for d in alpha beta gamma; do
+        mkdir -p "$T/src/$d"; for n in 1 2 3; do echo "content of $d/$n" > "$T/src/$d/f$n.txt"; done
+    done
+    # ---- chunks: a real chunk set, then aged to 30 days (the default CHUNK_MAX_AGE is 24 h)
+    export SOURCE_PATH="$T/src" STATE_DIR="$T/src/.nas-sync-state" CHUNK_COUNT=4
+    timeout --kill-after=10 300 "$S/generate-chunks.sh" > "$T/stale-gen.log" 2>&1
+    unset SOURCE_PATH STATE_DIR CHUNK_COUNT
+    CMETA="$T/src/.nas-sync-state/common/chunks/chunks.meta"
+    check "stale: a chunk set was published" '[ -f "$CMETA" ]'
+    sed -i "s/^generated_at=.*/generated_at=$(( $(date +%s) - 2592000 ))/" "$CMETA"
+    DST=$(fresh_dst stale-chunks)
+    LOCAL_NAS_PATH="$DST" PARALLEL_WORKERS=2 timeout --kill-after=10 300 "$S/nas-sync-parallel.sh" > "$T/stale-c0.log" 2>&1
+    RC=$?
+    check "control, default CHUNK_MAX_AGE: a 30-day-old chunk set is rejected as stale, the run falls back to the top-level split (rc=$RC)" \
+        '[ "$RC" -eq 0 ] && grep -q "Chunks are stale (age=[0-9]*s > 86400s)" "$T/stale-c0.log" && ! grep -q "Using [0-9]* server-generated chunks" "$T/stale-c0.log"'
+    for v in abc 1h -5 1.5 99999999999999999999; do
+        LOCAL_NAS_PATH="$DST" CHUNK_MAX_AGE="$v" PARALLEL_WORKERS=2 timeout --kill-after=10 300 "$S/nas-sync-parallel.sh" > "$T/stale-c1.log" 2>&1
+        RC=$?
+        check "CHUNK_MAX_AGE='$v': WARN naming the value, the default 86400 applies, the stale set is rejected and not used (rc=$RC)" \
+            '[ "$RC" -eq 0 ] && grep -q "WARN: CHUNK_MAX_AGE=.$v. is not a non-negative integer — using 86400" "$T/stale-c1.log" && grep -q "Chunks are stale (age=[0-9]*s > 86400s)" "$T/stale-c1.log" && ! grep -q "Using [0-9]* server-generated chunks" "$T/stale-c1.log"'
+    done
+    # Valid values must still work: with a fresh set, a leading zero is decimal and not a WARN.
+    sed -i "s/^generated_at=.*/generated_at=$(date +%s)/" "$CMETA"
+    LOCAL_NAS_PATH="$DST" CHUNK_MAX_AGE=0086400 PARALLEL_WORKERS=2 timeout --kill-after=10 300 "$S/nas-sync-parallel.sh" > "$T/stale-c2.log" 2>&1
+    RC=$?
+    check "CHUNK_MAX_AGE=0086400 (valid, leading zeros): no WARN, a fresh chunk set is used (rc=$RC)" \
+        '[ "$RC" -eq 0 ] && ! grep -q "CHUNK_MAX_AGE" "$T/stale-c2.log" && grep -q "Using [0-9]* server-generated chunks" "$T/stale-c2.log"'
+    LOCAL_NAS_PATH="$DST" CHUNK_MAX_AGE=abc PARALLEL_WORKERS=2 timeout --kill-after=10 300 "$S/nas-sync-parallel.sh" > "$T/stale-c3.log" 2>&1
+    RC=$?
+    check "CHUNK_MAX_AGE=abc with a fresh set: WARN, and the fresh set is still used (the fallback value is not over-strict) (rc=$RC)" \
+        '[ "$RC" -eq 0 ] && grep -q "WARN: CHUNK_MAX_AGE=.abc. is not a non-negative integer" "$T/stale-c3.log" && grep -q "Using [0-9]* server-generated chunks" "$T/stale-c3.log"'
+
+    # ---- manifest: client "cs" has a manifest of one file whose meta says it is 30 days old
+    MDIR="$T/src/.nas-sync-state/clients/cs"; mkdir -p "$MDIR"
+    printf 'alpha/f1.txt\n' > "$MDIR/sync-manifest.txt"
+    manifest_meta() { printf 'generated_at=%s\nwindow_threshold_epoch=0\nfile_count=1\n' "$1" > "$MDIR/manifest.meta"; }
+    manifest_meta $(( $(date +%s) - 2592000 ))
+    DST2=$(fresh_dst stale-manifest)
+    CLIENT_ID=cs LOCAL_NAS_PATH="$DST2" timeout --kill-after=10 300 "$S/nas-sync-incremental.sh" > "$T/stale-m0.log" 2>&1
+    RC=$?
+    check "control, default MANIFEST_MAX_AGE: a 30-day-old manifest fails the run as STALE and syncs nothing (rc=$RC)" \
+        '[ "$RC" -ne 0 ] && grep -q "Manifest is STALE (.*s > 86400s)" "$T/stale-m0.log" && [ ! -e "$DST2/alpha/f1.txt" ]'
+    for v in abc 1h -5 1.5 99999999999999999999; do
+        CLIENT_ID=cs LOCAL_NAS_PATH="$DST2" MANIFEST_MAX_AGE="$v" timeout --kill-after=10 300 "$S/nas-sync-incremental.sh" > "$T/stale-m1.log" 2>&1
+        RC=$?
+        check "MANIFEST_MAX_AGE='$v': WARN naming the value, the default 86400 applies, the stale manifest fails the run and syncs nothing (rc=$RC)" \
+            '[ "$RC" -ne 0 ] && grep -q "WARN: MANIFEST_MAX_AGE=.$v. is not a non-negative integer — using 86400" "$T/stale-m1.log" && grep -q "Manifest is STALE (.*s > 86400s)" "$T/stale-m1.log" && [ ! -e "$DST2/alpha/f1.txt" ]'
+    done
+    manifest_meta "$(date +%s)"
+    CLIENT_ID=cs LOCAL_NAS_PATH="$DST2" MANIFEST_MAX_AGE=0086400 timeout --kill-after=10 300 "$S/nas-sync-incremental.sh" > "$T/stale-m2.log" 2>&1
+    RC=$?
+    check "MANIFEST_MAX_AGE=0086400 (valid, leading zeros): no WARN, a fresh manifest is synced (rc=$RC)" \
+        '[ "$RC" -eq 0 ] && ! grep -q "MANIFEST_MAX_AGE" "$T/stale-m2.log" && [ -f "$DST2/alpha/f1.txt" ]'
+    rm -f "$DST2/alpha/f1.txt"
+    CLIENT_ID=cs LOCAL_NAS_PATH="$DST2" MANIFEST_MAX_AGE=abc timeout --kill-after=10 300 "$S/nas-sync-incremental.sh" > "$T/stale-m3.log" 2>&1
+    RC=$?
+    check "MANIFEST_MAX_AGE=abc with a fresh manifest: WARN, and the manifest is still synced (the fallback value is not over-strict) (rc=$RC)" \
+        '[ "$RC" -eq 0 ] && grep -q "WARN: MANIFEST_MAX_AGE=.abc. is not a non-negative integer" "$T/stale-m3.log" && [ -f "$DST2/alpha/f1.txt" ]'
 fi
 
 # ================================================================ lock

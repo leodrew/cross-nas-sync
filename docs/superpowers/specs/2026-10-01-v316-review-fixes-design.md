@@ -391,7 +391,7 @@ signals and PID 1. The harness turns the reproductions behind this spec into a r
 - **Default:** it runs inside `docker run --rm --privileged ubuntu:24.04` with the repo bind-mounted, so it
   works from Windows/MSYS and never touches the host.
 - **`--native`:** runs on a Linux host as root, for CI or a sandbox.
-- **Needs:** rsync, tini, perl, unshare; cron for `--slow`.
+- **Needs:** rsync, tini, perl, unshare; cron for `--slow`, and a C compiler for the `deploy` slow-cleanup sub-case (skipped without one; with `--case deploy` that skip makes the run exit 2).
 - A case is skipped with a WARN only when its tool is missing.
 
 | Case | Asserts |

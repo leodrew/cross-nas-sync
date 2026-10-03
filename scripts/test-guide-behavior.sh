@@ -18,7 +18,8 @@
 #   --slow     add the `deploy` case (waits for two cron minute boundaries, ~2-3 min).
 #   --case X   run only case X (repeatable): names loose swap lock signal deploy
 #              (deploy implies --slow). An unknown X exits 2; so does a requested case
-#              that was skipped, or a run in which no check ran.
+#              that was skipped, even in part (`--case deploy` without cc), or a run in which
+#              no check ran. Without --case, a skip is reported and the exit stays 0.
 #   NGB_KEEP=1 keep the workspace (logs of every run) and print its path
 #############################################
 set -uo pipefail
@@ -595,12 +596,15 @@ if [ "$SLOW" -eq 1 ] && want deploy; then
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
 #include <time.h>
-/* rename() into .rsync-partial/ waits NGB_STALL_MS with every signal blocked. */
+#include <unistd.h>
+/* rename() into .rsync-partial/ waits NGB_STALL_MS with every signal blocked, and leaves the
+   NGB_MARK file behind as proof that it did. */
 int rename(const char *from, const char *to) {
     static int (*real)(const char *, const char *);
     const char *ms = getenv("NGB_STALL_MS");
@@ -609,6 +613,8 @@ int rename(const char *from, const char *to) {
         long n = atol(ms);
         struct timespec req = { n / 1000, (n % 1000) * 1000000L }, rem;
         sigset_t all, old;
+        int f = open(NGB_MARK, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (f >= 0) close(f);
         sigfillset(&all);
         sigprocmask(SIG_BLOCK, &all, &old);
         while (nanosleep(&req, &rem) == -1 && errno == EINTR) req = rem;
@@ -626,10 +632,13 @@ int kill(pid_t pid, int sig) {
     return real(pid, sig);
 }
 CEOF
-            cc -shared -fPIC -O1 -o "$T/stall.so" "$T/stall.c" -ldl 2>"$T/stall.cc.log" && STALL_SO="$T/stall.so"
+            cc -shared -fPIC -O1 -DNGB_MARK="\"$T/stall.mark\"" -o "$T/stall.so" "$T/stall.c" -ldl 2>"$T/stall.cc.log" \
+                && STALL_SO="$T/stall.so"
         fi
-        if [ -z "$STALL_SO" ]; then
-            skip "Deployment, cron-launched run, slow cleanup: no working C compiler (cc) to build the LD_PRELOAD stall (install gcc and libc6-dev)"
+        if ! command -v cc >/dev/null 2>&1; then
+            skip "Deployment, cron-launched run, slow cleanup: no C compiler (cc) to build the LD_PRELOAD stall (install gcc and libc6-dev)"
+        elif [ -z "$STALL_SO" ]; then
+            skip "Deployment, cron-launched run, slow cleanup: cc could not build the LD_PRELOAD stall: $(head -n 1 "$T/stall.cc.log") (missing libc6-dev?)"
         else
             fresh_src; echo tiny > "$T/src/tiny.txt"
             DST=$(fresh_dst dep-slow)
@@ -638,6 +647,9 @@ CEOF
             shim_set 4000 "" "$STALL_SO" "$STALL_MS"
             SYNC_MODE=standard LOCAL_NAS_PATH="$DST" CRON_SCHEDULE='* * * * *' \
                 sigterm_run "Deployment, cron-launched run, slow cleanup" "$DST" "$T/dep-slow.log" "-g" -- "$S/entrypoint-deployment.sh"
+            # Without this the four checks above pass vacuously whenever the preload does not load
+            # (ld.so only warns, e.g. on a noexec /tmp) or never fires: the run is then a plain single-TERM run.
+            check "Deployment, cron-launched run, slow cleanup: the preload really stalled rename() (marker)" '[ -e "$T/stall.mark" ]'
         fi
         # The cron daemon lived inside the PID namespace and died with its PID 1.
         shim_off

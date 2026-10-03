@@ -106,7 +106,9 @@ CronJob will fail loudly if you deploy it first.
 ```bash
 # 1. Write the server scripts and Dockerfile:
 #      §4.2 entrypoint.sh, §4.3 generate-manifests.sh,
-#      §4.6 generate-chunks.sh, §4.4 Dockerfile
+#      §4.6 generate-chunks.sh, §4.7 nas-sync-state-lock.sh,
+#      §4.4 Dockerfile
+#    The Dockerfile COPYs all four scripts; leave one out and `docker build` fails.
 #    ALL scripts must be LF-only. On Windows: sed -i 's/\r$//' *.sh
 # 2. Build & push (§4.5)
 cd cluster-b/scripts
@@ -163,7 +165,9 @@ kubectl --context cluster-b exec deployment/nas-sync-server -n ea-pmc -c nas-syn
 ### Phase 3 — Target cluster (Cluster A)
 
 ```bash
-# 1. Write the client scripts: §8.2–§8.7, §8.10, and the §8.8 Dockerfile. LF only.
+# 1. Write the client scripts: §8.2–§8.7, §8.10, §8.11 (nas-sync-lib.sh, which every
+#    script sources) and the §8.8 Dockerfile. The Dockerfile COPYs all eight scripts; leave
+#    one out and `docker build` fails. LF only.
 # 2. Build & push (§8.9)
 cd cluster-a/scripts
 docker build -t ${REGISTRY}/nas-sync-client:3.16 . && docker push ${REGISTRY}/nas-sync-client:3.16
@@ -262,8 +266,10 @@ kubectl --context cluster-a exec deployment/nas-sync-client-deploy -n ea-pmc -c 
 **Do not** leave the Deployment running as your permanent solution unless you intend to —
 go to [S3](#s3--cut-over-bulk--routine).
 
-> **Expect `rsync_rc=24`.** On a live source, files vanishing mid-run is normal; v3.15 maps
-> 23/24 to success. A different nonzero code is a real failure.
+> **Expect `rsync_rc=24`.** On a live source, files vanishing mid-run is normal; the transfers
+> map 23/24 to success (v3.15). The `parallel` fallback's top-level listing and `verify` are
+> stricter: they accept rc 24 but fail on rc 23 (guide §13). A different nonzero code is a real
+> failure.
 
 ---
 
@@ -432,6 +438,9 @@ kubectl exec <any-client-pod> -n ea-pmc -c nas-sync-client -- \
          cat /mnt/nas-target/.nas-sync-status/last-success'
 ```
 
+On a CronJob-only target there is no running pod to exec into: read the same two files with the
+throw-away pod in guide §13, "Is the sync even running?".
+
 `last-success` older than 2× the CronJob interval → investigate ([S12](#s12--triage-decision-tree)).
 `interrupted=TERM` at the end of `last-run` means the pod was stopped mid-sync (deadline,
 drain, rollout); the partial file is kept and the next run resumes it (guide §13).
@@ -494,7 +503,9 @@ VERIFY RESULT mode=meta drift=0 checked=7412330 elapsed=3812s threshold=0
 |---|---|---|
 | `drift=0`, job Completed | Target matches within the metadata tier | Nothing |
 | `drift=N`, job Failed | N entries differ | Repair below |
-| Job Failed with no RESULT line | Verify itself broke (connectivity, mount) | [S12](#s12--triage-decision-tree) |
+| Job Failed with no RESULT line, exit 23 | rsync could not read part of the source (`opendir … Permission denied`, an I/O error), so that part was **not compared**: this is not drift | Fix the read access on NAS B for the rsync daemon's user, or exclude the entry (below), then re-run |
+| Job Failed with no RESULT line, exit 1 and `VERIFY_…='…' is not …` | An invalid `VERIFY_MODE`, `VERIFY_SLICES` or `VERIFY_FAIL_THRESHOLD`: verify refuses to run on it | Correct the value in the CronJob (§9A.5) |
+| Job Failed with no RESULT line, any other exit | Verify itself broke (connectivity, mount) | [S12](#s12--triage-decision-tree) |
 
 **Repair:**
 
@@ -512,6 +523,13 @@ monthly if that matters to you.
 
 **Timing.** Run verify **after** the weekly reconcile, when the tree is at rest. Run it
 before, and you are measuring the week's normal churn, not drift.
+
+**A permanently unreadable entry** (for example `lost+found`, mode 700, under a root-squashing
+export) fails every verify run with exit 23 until it is excluded: add it to `rsync-exclude.txt`
+(guide §9A.1; the sync and verify read the same file) if it is not meant to be replicated, or
+make it readable if its data must reach NAS A. The sync tolerated such an entry silently, so
+a verify that was green on v3.15 can turn red after the [S11](#s11--version-upgrade) upgrade
+for exactly this reason (guide §13, "Drift detected").
 
 **Persistent nonzero drift** usually means the sync and verify exclude lists have diverged,
 or NAS A rejected some writes. If you have a genuine known baseline, set
@@ -539,7 +557,8 @@ outage 10h  →  hours 6–10 of changes are in no future manifest → run a rec
 ### Procedure
 
 ```bash
-# 1. How long was it actually out?
+# 1. How long was it actually out? (A CronJob-only target has no running pod to exec into:
+#    use the throw-away pod of guide §13, "Is the sync even running?".)
 kubectl exec <pod> -n ea-pmc -c nas-sync-client -- cat /mnt/nas-target/.nas-sync-status/last-success
 # Compare that timestamp to now.
 
@@ -599,8 +618,10 @@ alternative is re-syncing a frozen manifest forever while reporting success.
 
 ```bash
 kubectl --context cluster-b get cronjob nas-sync-manifest -n ea-pmc
-kubectl --context cluster-b get jobs -n ea-pmc -l role=manifest \
-  --sort-by=.metadata.creationTimestamp | tail -5
+# The Jobs carry no role label (it is on the CronJob only): find them by their owner, the CronJob.
+kubectl --context cluster-b get jobs -n ea-pmc --sort-by=.metadata.creationTimestamp \
+  -o custom-columns=NAME:.metadata.name,CRONJOB:.metadata.ownerReferences[0].name,SUCCEEDED:.status.succeeded,FAILED:.status.failed \
+  | grep -E 'CRONJOB|nas-sync-manifest'
 kubectl --context cluster-b logs job/<latest> -n ea-pmc
 ```
 
@@ -684,6 +705,7 @@ kubectl --context cluster-b apply -f cluster-b/cronjob-chunks.yaml
 kubectl --context cluster-a apply -f cluster-a/cronjob-client.yaml
 kubectl --context cluster-a apply -f cluster-a/cronjob-reconcile.yaml
 kubectl --context cluster-a apply -f cluster-a/cronjob-verify.yaml
+kubectl --context cluster-a apply -f cluster-a/deployment-client.yaml   # only if this target runs the Deployment (§10B.1)
 
 # 5. Prove it on one target before rolling the rest
 kubectl --context cluster-a create job --from=cronjob/nas-sync-client upgrade-check -n ea-pmc
@@ -699,10 +721,12 @@ kubectl exec $POD -n ea-pmc -c nas-sync-client -- ls /userapp/scripts/          
 kubectl logs $POD -n ea-pmc -c nas-sync-client | grep -E 'client=|Incremental:|FULL sync fallback'
 ```
 
-**Rollback** is a tag change — no state migration is involved in either direction:
+**Rollback** is a tag change — no state migration is involved in either direction. The tag is
+the version you upgraded **from** (here v3.15; repeat for the reconcile and verify CronJobs, and
+for the Deployment if the target runs one):
 
 ```bash
-kubectl set image cronjob/nas-sync-client nas-sync-client=${REGISTRY}/nas-sync-client:3.14 -n ea-pmc
+kubectl set image cronjob/nas-sync-client nas-sync-client=${REGISTRY}/nas-sync-client:3.15 -n ea-pmc
 ```
 
 **Upgrading v3.14 → v3.15 specifically:** see the migration appendix at the end of the guide.
@@ -713,6 +737,16 @@ thing you must not skip is adding `CLIENT_ID` to the Deployment (§10B.1) if it 
 **Upgrading v3.15 → v3.16:** let in-flight `nas-sync-manifest` / `nas-sync-chunks` Jobs finish
 before applying the new CronJobs (a v3.15 generator takes no lock), then follow the order above.
 Details: the guide's appendix "Also required when coming from v3.15 → v3.16".
+
+**Expect one behaviour change in verify.** v3.15 tolerated rsync rc 23, so an entry the rsync
+daemon cannot read (typically `lost+found` under a root-squashing export) never showed. v3.16
+`verify` fails with exit 23 on it, and a v3.15-green monthly verify can turn red the first time it
+runs on v3.16. It is not drift and nothing was lost on the target: fix the read access, or add the
+entry to `rsync-exclude.txt` if it is not meant to be replicated ([S7](#s7--drift-check), guide §13
+"Drift detected"). The same applies to a `parallel` fallback whose top-level listing ends rc 23
+(`Cannot list top-level folders (rsync rc=23)`). An invalid `VERIFY_MODE`, `VERIFY_SLICES` or
+`VERIFY_FAIL_THRESHOLD` that v3.15 ran with silently now fails the run with exit 1 and names the
+setting.
 
 ---
 
@@ -725,16 +759,21 @@ kubectl exec <pod> -n ea-pmc -c nas-sync-client -- \
   sh -c 'cat /mnt/nas-target/.nas-sync-status/last-run; cat /mnt/nas-target/.nas-sync-status/last-success'
 ```
 
+(A CronJob-only target has no running pod to exec into: use the throw-away pod of guide §13,
+"Is the sync even running?".)
+
 | Symptom | Most likely cause | Go to |
 |---|---|---|
 | Pod stuck `NotReady`, job never completes | Istio sidecar wasn't quit | guide §13 "Pod stuck NotReady" |
 | `tini exec … No such file or directory` | CRLF in a script | guide §13; rebuild after `sed -i 's/\r$//'` |
 | `Remote not reachable` but the source is healthy | Sidecar-start race | guide §13; add the §9A.2 annotation, raise `PREFLIGHT_RETRIES` |
 | `Remote not reachable` on **every** target at once | Source side down | [S9](#s9--source-side-failure) |
-| Job `Failed`, log looks fine, `rsync_rc=24` | Normal — files vanished mid-run | Nothing; v3.15 maps 23/24 to success |
+| Job `Failed`, log looks fine, `rsync_rc=24` | Normal — files vanished mid-run | Nothing; the transfers map 23/24 to success (the `parallel` listing and `verify` fail on 23, below) |
 | `Manifest fetch failed — FULL sync fallback` | `CLIENT_ID` unset, unregistered, or misspelled | Below |
 | `Manifest is STALE` | Generator stopped | [S9](#s9--source-side-failure) |
 | Verify job `Failed`, `drift=N` | Real divergence | [S7](#s7--drift-check) |
+| Verify job `Failed`, exit 23, no `VERIFY RESULT` line | A source directory the rsync daemon cannot read: not compared, not drift. Often shows up after a v3.15 → v3.16 upgrade | [S7](#s7--drift-check) (fix access, or exclude it); guide §13 "Drift detected" |
+| `parallel` Job `Failed`: `Cannot list top-level folders (rsync rc=23)` | The top-level listing could not read an entry; the run refuses to continue with a short list | Fix the read access, or exclude the entry; guide §13 "Job shows Failed" |
 | `falling back to top-level split` | Chunks missing/stale | Harmless; guide §13 "Chunks stale" |
 | Generator Job `Failed`: `lock '…' held by […]` or `cannot determine the age of lock '…'` (exit 75) | Held: another run of the same generator is in progress. Age unknown: unhealthy source NAS (full, over quota, read-only, stale mount) | guide §13 "Generator Job Failed"; held: wait, then re-run; age unknown: fix the NAS first |
 | `last-run` ends in `interrupted=TERM` | Pod stopped mid-sync | guide §13 "Status shows interrupted=TERM" |
@@ -776,8 +815,9 @@ v3.14 env allow-list bug — the fix is in v3.15 §8.7 and requires the rebuilt 
 | `CHUNK_MAX_AGE` | client env | Reconciles are staggered across the week ([S5](#s5--steady-state)) | Older chunks may miss recently added files (the reconcile still transfers them, just unbalanced) |
 | `MANIFEST_MAX_AGE` | client env | Generator legitimately runs less often than daily | Weakens the stale-generator guard |
 | `RSYNC_TIMEOUT` | client env | Large files over a slow link time out mid-transfer | A genuinely hung transfer takes longer to fail |
+| `RSYNC_LIST_TIMEOUT` | client env | The chunk-list fetch or the top-level listing hits its idle timeout on a slow link (`rc=30`; default 300s). Idle seconds, not run time | A dead connection takes longer to fail before the run falls back or stops |
 | `activeDeadlineSeconds` | CronJob spec | Jobs are killed while still making progress | A hung job occupies the slot longer |
-| `VERIFY_SLICES` | verify env | You want full checksum coverage faster | Each run reads more bytes on both NASes |
+| `VERIFY_SLICES` | verify env | You want full checksum coverage faster (a positive integer; anything else fails the run) | Each run reads more bytes on both NASes |
 
 **Rules of thumb:**
 
@@ -798,8 +838,8 @@ v3.14 env allow-list bug — the fix is in v3.15 §8.7 and requires the rebuilt 
 # How long do runs actually take, and how much do they move?
 kubectl logs -n ea-pmc -l role=client --tail=200 | grep 'COMPLETE'
 kubectl logs -n ea-pmc -l role=client --tail=200 | grep 'Incremental:'
-# Generator walk time:
-kubectl --context cluster-b logs -n ea-pmc -l role=manifest --tail=100 | grep -E 'Walking|Done'
+# Generator walk time (the Jobs carry no role label: take the latest from the list in S9):
+kubectl --context cluster-b logs job/<latest-manifest-job> -n ea-pmc | grep -E 'Walking|Done'
 ```
 
 ---

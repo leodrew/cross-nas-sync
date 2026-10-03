@@ -369,9 +369,11 @@ log "Done."
 > **One generator at a time (v3.16).** The script takes the `manifests` lock (§4.7) before it
 > writes anything. A second run — typically a manual `kubectl create job --from=cronjob/…`
 > while the scheduled one is still walking — exits **75** and changes nothing; re-run it after
-> the first finishes. Every temp file carries the run id, and both the manifest and
-> `manifest.meta` are renamed into place atomically, so a reader never sees a half-written
-> manifest or meta. The lock is what keeps two runs from overlapping.
+> the first finishes. The same exit 75 means the lock's age could not be read (an unhealthy
+> source NAS, §13): the run fails closed and does nothing. Every temp file carries the run id,
+> and both the manifest and `manifest.meta` are renamed into place atomically, so a reader
+> never sees a half-written manifest or meta. The lock is what keeps two runs from
+> overlapping.
 
 ### 4.4 File: `cluster-b/scripts/Dockerfile` (CRLF-safe)
 
@@ -571,7 +573,9 @@ log "Done."
 > `kubectl create job --from=cronjob/…` (the runbook uses these in S1, S2, S4 and S9) or a
 > replacement pod still overlaps the scheduled one, and two overlapping generators tear the
 > manifest and publish a half-written chunk set. With this library the second run exits
-> **75** without touching anything and logs who holds the lock.
+> **75** without touching anything and logs who holds the lock. A lock whose age cannot be
+> read (an unhealthy source NAS) also ends the run with 75: it fails closed rather than risk
+> breaking a live run's lock, and the log says so (§13).
 
 ```bash
 #!/bin/bash
@@ -2258,6 +2262,13 @@ docker run --rm ${REGISTRY}/nas-sync-client:3.16 sh -c \
 > `VERIFY_FAIL_THRESHOLD`, which makes the Job show `Failed` — drift becomes visible instead
 > of silent. Repair is the reconcile's job (§9A.4). This is the direct control for everything
 > in §12.1 that mtime-based incremental sync cannot see.
+>
+> **It also fails when it could not compare everything.** An rsync exit 23 (a directory of the
+> source could not be read) fails the run with exit 23 instead of passing it with a smaller
+> `drift` count, and a `VERIFY_MODE`, `VERIFY_SLICES` or `VERIFY_FAIL_THRESHOLD` that is not
+> valid fails it with exit 1 before anything is compared. rc 24 (an entry vanished mid-scan)
+> is still normal. Details and the fix for an entry that is permanently unreadable: §13,
+> "Drift detected".
 
 ```bash
 #!/bin/bash
@@ -2994,7 +3005,9 @@ kubectl apply -f cluster-a/cronjob-reconcile.yaml
 > Drift detection (§8.10). Transfers nothing. Schedule it **after** the reconcile has
 > finished, so the tree is at rest and any drift it reports is real rather than the week's
 > normal churn. A nonzero drift count fails the Job, which is the point — it turns silent
-> divergence into something `kubectl get jobs` shows you.
+> divergence into something `kubectl get jobs` shows you. So does a run that could not compare
+> everything: exit 23 when part of the source is unreadable, exit 1 for an invalid `VERIFY_*`
+> value (§13, "Drift detected"). A Job that fails that way has no `VERIFY RESULT` line.
 
 ```yaml
 apiVersion: batch/v1
@@ -3265,10 +3278,15 @@ kubectl logs $POD -n ea-pmc -c nas-sync-client | grep -E 'client=|Incremental:|F
 #    Expected: "client=nas-a" and "Incremental: N changed files"
 #    A "FULL sync fallback" line means CLIENT_ID is unset or unregistered (§13).
 
-# 2. Status file written on the target NAS.
-kubectl exec $POD -n ea-pmc -c nas-sync-client -- cat /mnt/nas-target/.nas-sync-status/last-run
-kubectl exec $POD -n ea-pmc -c nas-sync-client -- cat /mnt/nas-target/.nas-sync-status/last-success
-#    Expected: ts=... mode=incremental client=nas-a exit=0 elapsed=...s host=...
+# 2. Status file written on the target NAS. A CronJob-only target has no running client pod
+#    to exec into (the test Job's pod has finished), so read the files with a throw-away pod
+#    that mounts the target PVC (same pattern as "Verify No-Delete" below; nas-a-target-pvc =
+#    this target's PVC). With a Deployment pod running you can instead
+#    kubectl exec <pod> -n ea-pmc -c nas-sync-client -- cat /mnt/nas-target/.nas-sync-status/last-run
+kubectl run tmp-status --rm -it --restart=Never --image=busybox -n ea-pmc \
+  --overrides='{"spec":{"volumes":[{"name":"nas","persistentVolumeClaim":{"claimName":"nas-a-target-pvc"}}],"containers":[{"name":"tmp","image":"busybox","command":["sh","-c","cat /mnt/.nas-sync-status/last-run /mnt/.nas-sync-status/last-success"],"volumeMounts":[{"name":"nas","mountPath":"/mnt"}]}]}}'
+#    Expected: two lines (last-run, then last-success):
+#    ts=... mode=incremental client=nas-a exit=0 elapsed=...s host=...
 
 # 3. Verify mode — on an at-rest tree, expect drift=0 and a Completed job.
 kubectl create job --from=cronjob/nas-sync-verify test-verify -n ea-pmc
@@ -3311,11 +3329,13 @@ kubectl --context cluster-b create job --from=cronjob/nas-sync-manifest lock-tes
 sleep 15
 kubectl --context cluster-b logs -n ea-pmc -l 'job-name in (lock-test,lock-test-2)' --tail=-1 | grep -E "Lock 'manifests' acquired|held by|cannot determine the age"
 #    Expected: one "acquired" (lock-test, a real run: let it finish before deleting it, because
-#    a killed run keeps its lock until LOCK_STALE, 600s) and one "held by [... host=<lock-test
-#    pod> ...]" (lock-test-2: the pod exits 75, and the Job retries it before it shows Failed).
-#    Two "held by" lines mean a scheduled run was already walking; "cannot determine the age"
-#    means an unhealthy NAS (§13). An error or no output: a pod was still starting, so repeat
-#    the logs command.
+#    a killed run keeps its lock until LOCK_STALE, 600s) and at least one "held by [...
+#    host=<lock-test pod> ...]" (lock-test-2: the pod exits 75 and the Job retries it after a
+#    growing delay, so every retry adds one more "held by" line).
+#    Only "held by" lines and no "acquired": a scheduled run was already walking, so both Jobs
+#    lost. Two "acquired": the first walk ended before lock-test-2 started (a tiny tree), so
+#    the lock was not exercised. "cannot determine the age" means an unhealthy NAS (§13). An
+#    error or no output: a pod was still starting, so repeat the logs command.
 kubectl --context cluster-b delete job lock-test-2 -n ea-pmc   # now, or it retries into a second walk
 #    When lock-test has finished: kubectl --context cluster-b delete job lock-test -n ea-pmc
 
@@ -3324,8 +3344,10 @@ kubectl --context cluster-b exec deployment/nas-sync-server -n ea-pmc -c nas-syn
   cat /mnt/nas-source/.nas-sync-state/common/chunks/chunks.meta
 #    Expected: generated_at=… generation=g… chunk_count=24 total_files=…
 #    No generation= line: the set predates v3.16 (the weekly chunk job has not run on the v3.16
-#    image yet). Run it, then repeat this check:
+#    image yet). "No such file": v3.15 check 6 removed chunks.meta. Either way run the chunk
+#    job, wait for it to finish (it walks the whole tree), then repeat this check:
 #      kubectl --context cluster-b create job --from=cronjob/nas-sync-chunks chunks-v316 -n ea-pmc
+#      kubectl --context cluster-b wait --for=condition=complete job/chunks-v316 -n ea-pmc --timeout=7200s
 
 # 3. Graceful shutdown: delete a running sync pod, then read the status file.
 kubectl create job --from=cronjob/nas-sync-reconcile term-test -n ea-pmc
@@ -3430,6 +3452,20 @@ comparison and delete them by hand after review; never add `--delete`.
 Drop the reconcile and the first row silently becomes your whole strategy. Drop verify and you
 have no evidence any of it works.
 
+**Known limitation: verify cannot detect an emptied source.** Verify compares what the rsync
+daemon serves with the target, and it never removes a target-only file. If the daemon serves
+an empty directory (for example the server's NFS mount is missing and the daemon serves the
+empty directory underneath it), the default `meta` mode finds nothing to compare and reports
+`drift=0` (`VERIFY OK`). `checksum` and `both` stop with `Tier 2: no top-level dirs listed`
+when the source is empty at the moment of the listing; if it empties after the listing, each
+slice folder is reported as removed (a WARN, skipped) and the run still ends `VERIFY OK`.
+The server has no guard against this: §4.2 tests `mountpoint` once at start-up and only logs a
+WARN (`NAS not detected as mountpoint`); it does not stop the daemon, and nothing re-checks
+the mount while the daemon runs. Nothing is lost on the target (the sync never removes
+target-only files), but a green verify proves nothing about a source that went empty. Watch
+the server pod's start-up log for that WARN, and treat `No folders found` from `parallel`'s
+fallback or a manifest with `file_count=0` (`manifest.meta`) as the same symptom.
+
 ---
 
 ## 13. Troubleshooting
@@ -3520,9 +3556,14 @@ kubectl logs <pod> -n ea-pmc -c nas-sync-client | tail -3
 ```
 
 `rsync_rc=24` ("some files vanished during transfer") and `23` are **normal** on a live
-source and v3.15 maps them to exit 0. If you see `exit=` non-zero with a different code,
-that is a real failure — look further up the log. rc=23 with many entries usually means
-permission problems reading the source.
+source for the *transfers*, and v3.15 maps them to exit 0. If you see `exit=` non-zero with a
+different code, that is a real failure — look further up the log. rc=23 with many entries
+usually means permission problems reading the source.
+
+Two steps are stricter, because a list or a comparison that silently skips an unreadable
+directory is worse than a failed run. The top-level listing behind `parallel`'s fallback
+accepts rc 0 and 24 only: rc 23 ends the run with `Cannot list top-level folders (rsync rc=23)`
+(exit 1, no COMPLETE line). `verify` fails on rc 23 as well (see "Drift detected" below).
 
 ### Drift detected (verify job Failed)
 
@@ -3547,15 +3588,36 @@ A verify Job that fails with **exit 23** and no `VERIFY RESULT` line is not drif
 read part of the source (`opendir … Permission denied`, an I/O error), so that part was not
 compared and `drift=0` would have said nothing about it. The log names the folder (tier 2) or
 shows rsync's own error lines (tier 1). Fix the read access on NAS B for the rsync daemon's user,
-then re-run verify. rc 24 (an entry vanished during the scan) is still normal and is tolerated.
+then re-run verify. rc 24 (an entry vanished during the scan) is still normal and is tolerated;
+so is a tier 2 folder that was removed between the listing and its check (a WARN line, the folder
+is skipped).
+
+If the entry is **permanently** unreadable and is not meant to be replicated (for example
+`lost+found`, mode 700, under a root-squashing export), add it to `rsync-exclude.txt` (the
+`rsync-exclude-config` ConfigMap, §9A.1). The sync and verify read the same file, so both then
+skip it, and the next Job picks the change up. The sync has been tolerating such an entry
+silently (rc 23 is only a WARN there, and the entry is never replicated), so **a v3.15 → v3.16
+upgrade can turn a previously green monthly verify red for exactly this reason**. Excluding an
+entry does not copy it: if its data must reach NAS A, fix the access instead.
+
+A verify Job that fails with **exit 1** and `VERIFY_MODE=…`, `VERIFY_SLICES=…` or
+`VERIFY_FAIL_THRESHOLD=…` in its error line has an invalid setting. Verify checks them before it
+compares anything, because a typo would otherwise end in `VERIFY OK` with nothing compared.
+Correct the value in the CronJob (§9A.5) and re-run.
 
 ### Is the sync even running? (status file)
 
 ```bash
-# From any pod with the target PVC mounted:
-kubectl exec <any-pod> -n ea-pmc -c nas-sync-client -- \
+# A CronJob-only target has no running client pod to exec into. Read the files with a
+# throw-away pod that mounts the target PVC (nas-a-target-pvc = this target's PVC, §9A.1):
+kubectl run tmp-status --rm -it --restart=Never --image=busybox -n ea-pmc \
+  --overrides='{"spec":{"volumes":[{"name":"nas","persistentVolumeClaim":{"claimName":"nas-a-target-pvc"}}],"containers":[{"name":"tmp","image":"busybox","command":["sh","-c","cat /mnt/.nas-sync-status/last-run /mnt/.nas-sync-status/last-success"],"volumeMounts":[{"name":"nas","mountPath":"/mnt"}]}]}}'
+# With a running client pod (a Deployment pod, or a CronJob pod while it runs) you can exec instead:
+kubectl exec <running-pod> -n ea-pmc -c nas-sync-client -- \
   sh -c 'cat /mnt/nas-target/.nas-sync-status/last-run; cat /mnt/nas-target/.nas-sync-status/last-success'
 ```
+
+Two lines come back: `last-run`, then `last-success`.
 
 - `last-success` older than **2× the CronJob interval** → investigate.
 - `last-run` newer than `last-success` → the most recent attempt failed; its `exit=` field
@@ -3566,15 +3628,15 @@ kubectl exec <any-pod> -n ea-pmc -c nas-sync-client -- \
 ### Chunks stale / reconcile fell back to the top-level split
 
 ```bash
-kubectl logs -n ea-pmc -l role=reconcile --tail=100 | grep -E 'chunks|falling back'
+kubectl logs -n ea-pmc -l role=reconcile --tail=100 | grep -E 'Chunk|chunks|falling back|retrying'
 ```
 
 Messages and causes:
 
 | Log line | Cause | Fix |
 |---|---|---|
-| `No chunk lists available (rc=…)` | Chunk CronJob never ran, or `.nas-sync-state/common/chunks/` unreadable | Run §6.3 job; confirm the source mount is `readOnly: false` |
-| `Chunks are stale (age=… > …)` | Chunk job failed the last N weeks | Check `kubectl --context cluster-b get jobs -l role=chunks` |
+| `No chunk lists available (rc=…)` | Chunk CronJob never ran, or `.nas-sync-state/common/chunks/` unreadable, or the fetch hit its idle timeout (`rc=30`: no data for `RSYNC_LIST_TIMEOUT`, default 300s) | Run §6.3 job; confirm the source mount is `readOnly: false`; for `rc=30` check the connection to the server (the run fell back to the top-level split) |
+| `Chunks are stale (age=… > …)` | Chunk job failed the last N weeks | List the chunk Jobs with the command in "Generator Job Failed" below (`grep nas-sync-chunks`) and read the latest one's log |
 | `chunks.meta present but no chunk files` | A v3.15-format set (no generation in `chunks.meta`) lost its chunk files — the chunk job was interrupted mid-publish; a v3.16 set in that state reports `Chunk set inconsistent` | Re-run the chunk job; the next run self-heals |
 | `Chunk files vanished mid-fetch (rc=24)` | The fetch overlapped the chunk job's swap (v3.16) | Nothing — the client retries once after `CHUNK_RETRY_WAIT` (30s) and uses the new generation; if the retry fails too, the run falls back to the top-level split |
 | `Chunk set inconsistent (generation …)` | Same, caught by the generation check | Nothing if the retry succeeds (otherwise the run falls back); if it repeats weekly, the chunk job runs into the reconcile — schedule it earlier |
@@ -3592,7 +3654,7 @@ change goes unseen.
 
 ```bash
 kubectl --context cluster-b get cronjob nas-sync-manifest -n ea-pmc
-kubectl --context cluster-b get jobs -n ea-pmc -l role=manifest --sort-by=.metadata.creationTimestamp | tail -5
+# The manifest Jobs: the command in "Generator Job Failed" below, filtered with grep nas-sync-manifest
 kubectl --context cluster-b logs job/<latest-manifest-job> -n ea-pmc
 ```
 
@@ -3611,17 +3673,21 @@ manifest job, 1 on the chunk job), so it shows Failed only if the lock still blo
 retry.
 
 ```bash
-# The ea-pmc namespace on Cluster B holds only these two generators' Jobs; they carry no role label.
-kubectl --context cluster-b get jobs -n ea-pmc --sort-by=.metadata.creationTimestamp | tail -5
+# The generators' Jobs carry no role label (it is on the CronJobs only), so find them by their
+# owner, the CronJob: scheduled Jobs and `create job --from` Jobs both name it, whatever you
+# called the Job. Cluster B's ea-pmc holds no other Jobs. To see one generator only, append
+# | grep -E 'CRONJOB|nas-sync-manifest' (or nas-sync-chunks; CRONJOB keeps the header row):
+kubectl --context cluster-b get jobs -n ea-pmc --sort-by=.metadata.creationTimestamp \
+  -o custom-columns=NAME:.metadata.name,CRONJOB:.metadata.ownerReferences[0].name,SUCCEEDED:.status.succeeded,FAILED:.status.failed
 kubectl --context cluster-b exec deployment/nas-sync-server -n ea-pmc -c nas-sync-server -- \
   sh -c 'ls -la /mnt/nas-source/.nas-sync-state/locks/; cat /mnt/nas-source/.nas-sync-state/locks/*/owner'
 ```
 
-- **`held by […]`** — the line ends `(heartbeat Ns ago)`: N under `LOCK_STALE` (600s) means a live
-  run. Wait for it to finish (`host=` in its `owner` file is the pod name), then re-run if you
-  still need the run. In runbook S4, a run that started before you edited the registry does not
-  include the new client. `another run broke lock '…' first` and `could not take lock` (also
-  exit 75) mean two runs raced for a stale lock: re-run.
+- **`held by […]`** — the owner is followed by `(heartbeat Ns ago)`: N up to `LOCK_STALE` (600s)
+  means a live run. Wait for it to finish (`host=` in its `owner` file is the pod name), then
+  re-run if you still need the run. In runbook S4, a run that started before you edited the
+  registry does not include the new client. `another run broke lock '…' first` and
+  `could not take lock` (also exit 75) mean two runs raced for a stale lock: re-run.
 - **`cannot determine the age of lock`** — a lock exists, but the script could not measure its
   age (it reads the NAS clock by touching a probe file, then stats the lock's `heartbeat`), so
   it fails closed and treats the lock as held rather than risk breaking a live run. Suspect the
@@ -3631,6 +3697,10 @@ kubectl --context cluster-b exec deployment/nas-sync-server -n ea-pmc -c nas-syn
 - A lock whose `heartbeat` is older than `LOCK_STALE` (600s) belongs to a dead run and the next
   run breaks it (`WARN: lock … is stale`). Never delete a lock by hand while its heartbeat is
   fresh — a run is still writing.
+- A `<job>.lock.stale.<run id>` directory beside the lock (in the `ls` above) is a displaced
+  lock: a run that broke a lock by mistake could not put it back, or was killed mid-break. It
+  protects nothing. The next run that takes the lock removes it once its heartbeat is older than
+  `LOCK_STALE` (`Removed the leftover displaced lock` in that run's log); until then leave it.
 
 ### Status shows `interrupted=TERM`
 
@@ -3771,7 +3841,10 @@ cluster-a/
 | Per-run temp names, atomic `manifest.meta` | v3.16 | ✓ (§4.3, §4.6) |
 | Folder names with any character (`--files-from --from0`) | v3.16 | ✓ (§8.11, §8.3) — spaces, CJK, quotes, glob characters |
 | Verify tier 2 sees every folder and reports rsync errors | v3.16 | ✓ (§8.10) — was blind to the same names |
-| Sync machinery never replicated by the fallback | v3.16 | ✓ (§8.11) — `.nas-sync-state/` was copied to targets |
+| Listings and verify do not tolerate rsync rc 23 | v3.16 | ✓ (§8.3, §8.10) — an unreadable folder was missing from the list, or `drift=0` said nothing about it; rc 24 stays tolerated, and so does a folder that vanished before its tier 2 check (§13) |
+| Settings that gate a check are validated | v3.16 | ✓ (§8.10, §4.7) — `VERIFY_MODE`/`VERIFY_SLICES`/`VERIFY_FAIL_THRESHOLD` fail the run, `LOCK_*` fall back with a WARN and are read as decimal; a typo ended in `VERIFY OK` or a lock-free run |
+| Metadata rsyncs time out (`RSYNC_LIST_TIMEOUT`, default 300s) | v3.16 | ✓ (§8.3, §8.11) — a dead connection hung the chunk fetch or the listing until the Job deadline |
+| Sync machinery never replicated by the fallback | v3.16 | ✓ (§8.11, §8.3) — `.nas-sync-state/` was copied to targets |
 | Top-level pass non-recursive | v3.16 | ✓ (§8.3) — `-a --dirs` was a full serial sync |
 | Fallback proves every unit ran | v3.16 | ✓ (§8.3) — an aborted xargs reported "all OK" |
 | Graceful SIGTERM on every path | v3.16 | ✓ (§8.2–§8.7, §8.10, §8.11, §9A.2, §9A.4, §9A.5, §10B.1) — rsync was SIGKILLed mid-file |
@@ -3832,8 +3905,8 @@ change in either direction.
 1. **Let in-flight generator runs finish.** A v3.15 generator takes no lock, so it could
    overlap the first v3.16 run:
    `kubectl --context cluster-b get jobs -n ea-pmc -o custom-columns=NAME:.metadata.name,ACTIVE:.status.active`
-   must show `<none>` in every ACTIVE cell. (The §6 Jobs carry no `role` label; that namespace
-   holds only the two generators' Jobs.)
+   must show `<none>` in every ACTIVE cell. (No selector: the §6 Jobs carry no `role` label, and
+   that namespace holds only the two generators' Jobs.)
 2. **Source side first.** Add §4.7 (`nas-sync-state-lock.sh`), update §4.3, §4.6 and the §4.4
    Dockerfile, rebuild the server image as `:3.16` (§4.5), roll the server Deployment, and
    re-apply §6.1 and §6.3. v3.15 clients keep working: they match the new chunk names, and a

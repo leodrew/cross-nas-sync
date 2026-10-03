@@ -104,37 +104,67 @@ Sourced by §4.3 and §4.6. Each job has its own lock: `manifests` and `chunks`.
 - `LOCK_HEARTBEAT`, default `60`;
 - `LOCK_STALE`, default `600`.
 
+`lock_acquire` validates both first. A value that is not a positive integer logs a WARN and falls back to its
+default. Both are then read as decimal (`10#`): `$(( ))` reads a leading zero as octal, so `LOCK_STALE=08` was an
+arithmetic error that let the job run **without the lock**, and `0120` meant 80. `LOCK_STALE` must also be at least
+2 × `LOCK_HEARTBEAT`: a live holder's heartbeat is up to one interval old, so a smaller value lets a contender break
+a live lock. Otherwise: WARN, and both revert to `600` and `60`.
+
 **`lock_acquire <name>`**
-1. `mkdir -p $STATE_DIR/locks`, then `mkdir <name>.lock`. `mkdir` is atomic on every NFS version; `flock`
-   was rejected because a `nolock` mount silently makes it node-local.
+1. `mkdir -p $STATE_DIR/locks` (failure: log and **exit 1**), then `mkdir <name>.lock`. `mkdir` is atomic on every
+   NFS version; `flock` was rejected because a `nolock` mount silently makes it node-local.
 2. **On success:**
    - write `owner`;
    - touch `heartbeat`;
    - start the heartbeat loop in the background;
    - register `lock_release` on EXIT;
+   - log "acquired" and run `_lock_sweep <name>` (below);
    - return 0.
-3. **On failure, measure the age of the existing lock.** Use a NAS-stamped clock: touch a probe file
-   `locks/.probe.<run_id>`, take its mtime as "now", then remove it. Pod clocks are never compared with NAS
-   mtimes.
-   - **Age ≤ `LOCK_STALE`:** log `lock '<name>' held by <owner> (heartbeat <age>s ago) — another run is in
-     progress; this run did nothing`, then **`exit 75`**. The Job shows Failed, which accurately says the run did
-     not happen. The runbook tells the operator to re-run after the holder finishes.
-   - **Age > `LOCK_STALE`:**
-     1. log a WARN;
-     2. `mv <name>.lock <name>.lock.stale.<run_id>`. Rename is atomic, so exactly one contender wins. A failed
-        `mv` means someone else won: exit 75.
-     3. `rm -rf` the renamed directory;
-     4. `mkdir` once more. If that fails, exit 75.
-   - **Age cannot be measured:** if the probe `touch` fails, or neither `heartbeat` nor the lock directory can be
-     stat'ed, while the lock directory exists, the contender fails closed: it treats the lock as held and
-     **exits 75**, and never breaks a lock it could not measure.
+3. **On failure, find out why.**
+   - **Nothing holds the name** (the lock directory does not exist, so `mkdir` failed for another reason): retry
+     once, then **exit 1** with `cannot create lock … source NAS read-only or out of quota?`. Nothing is held, so
+     this is not 75.
+   - **Otherwise measure the age of the existing lock.** Use a NAS-stamped clock: touch a probe file
+     `locks/.probe.<run_id>`, take its mtime as "now", then remove it. Pod clocks are never compared with NAS
+     mtimes. The heartbeat file's mtime is the lock's clock; the lock directory's own mtime stands in only when the
+     heartbeat does not exist (the holder died between its `mkdir` and its first touch).
+     - **Age ≤ `LOCK_STALE`:** log `lock '<name>' held by <owner> (heartbeat <age>s ago) — another run is in
+       progress; this run did nothing`, then **`exit 75`**. The Job shows Failed, which accurately says the run did
+       not happen. The runbook tells the operator to re-run after the holder finishes.
+     - **Age > `LOCK_STALE`:**
+       1. log a WARN;
+       2. `mv <name>.lock <name>.lock.stale.<run_id>`. Rename is atomic, so exactly one contender wins. A failed
+          `mv` means someone else won: exit 75;
+       3. re-read `owner` in the renamed directory. If it differs from the owner seen before the age check, this
+          run moved a **fresh** lock (another run broke the stale one and took the name in between): `mv -T` it
+          back and exit 75. If that restore fails because a third run holds the name, the displaced copy is removed
+          (WARN); if nothing holds the name, it is kept as `<name>.lock.stale.<run_id>` for inspection (WARN) and a
+          later run's sweep removes it. Either way the run exits 75;
+       4. otherwise `rm -rf` the renamed directory and `mkdir` once more (the second and last attempt). If that
+          fails and no lock directory exists, the run **exits 1**, as above: nothing is held, so 75 would be
+          wrong. If another run holds the name again, it is judged as in step 3 once more; a lock found stale
+          a second time is broken but not retaken: `could not take lock`, exit 75.
+     - **Age cannot be measured:** the probe `touch` fails, or `stat` of an *existing* heartbeat fails (stale handle,
+       I/O error), while the lock directory exists. The contender fails closed: it treats the lock as held and
+       **exits 75** (the log hints at a full, over-quota, read-only or stale source NAS), and never breaks a lock
+       it could not measure.
 
 **`lock_release`**
 - stop the heartbeat loop;
 - remove the lock directory **only if** `owner` still carries our `run_id`.
 
+**`_lock_sweep <name>`**, called once the lock is held, removes this name's leftover `<name>.lock.stale.*`
+directories: a displaced lock that could not go back, or one left by a run killed between the rename and the
+`rm`. A displaced directory gets no more heartbeats, so it is removed only when its own heartbeat is older than
+`LOCK_STALE` (the test that breaks a lock; a directory with no heartbeat file is aged by its own mtime). A younger
+one, one whose age cannot be read, a non-directory, another name's directory and `<name>.lock` itself are left
+alone.
+
 **A failed heartbeat `touch` is not fatal.** The loop logs a WARN and tries again at the next interval, so one
-transient NFS error does not silently end the heartbeat and let a live lock age into "stale".
+transient NFS error does not silently end the heartbeat and let a live lock age into "stale". The loop also ends
+with its parent: each interval it checks that the run's PID still exists, so a SIGKILLed run's orphan does not keep a
+dead lock fresh for ever, and its `sleep` has no stdout, so it cannot hold a `generate-… | tee` pipeline open after
+the run ends.
 
 **Why a heartbeat instead of a fixed TTL.** A walk may legitimately run for up to `activeDeadlineSeconds`
 (24 h). A TTL long enough to cover that would let one crashed run block the 2-hourly manifest job for a
@@ -157,7 +187,9 @@ Leftovers from crashed runs are removed only **while holding the lock**:
 
 These globs also cover the unsuffixed v3.15 names.
 
-Even if a lock were wrongly broken, the two runs could no longer write into each other's files.
+Even if a lock were wrongly broken, the two runs could no longer write into the same temp file, and a reader never
+sees a half-written manifest or meta (both are renamed into place). That is not isolation: the hygiene globs above
+delete another run's in-flight temp files, so the lock, not the names, is what keeps two runs apart.
 
 ### 4.4 Cross-job overlap (F8)
 
@@ -177,7 +209,7 @@ stay where they are, because moving them is unrelated refactoring.
 
 **`list_top_dirs`** writes NUL-terminated top-level directory names to stdout and returns rsync's rc.
 1. List:
-   `rsync --list-only -8 --password-file=… ${EXCLUDE_FILE:+--exclude-from="$EXCLUDE_FILE"} "${REMOTE_URL}/"`.
+   `rsync --list-only -8 --timeout="${RSYNC_LIST_TIMEOUT:-300}" --password-file=… ${EXCLUDE_FILE:+--exclude-from="$EXCLUDE_FILE"} "${REMOTE_URL}/"`.
    Applying the client exclude file here drops `.nas-sync-state`, `.git`, and similar names with the same semantics
    as the sync itself (F4e).
 2. Keep only lines matching
@@ -193,6 +225,16 @@ stay where they are, because moving them is unrelated refactoring.
    - bash `printf %b` is unsafe here, because it would also turn a literal `\n` inside a name into a newline.
    - `perl` comes from `perl-base`, which is Essential in `ubuntu:24.04`.
    - §8.8's tool check gains `command -v perl`.
+
+**Callers accept rc 0 and 24 only** (§5.2 fallback, §5.3 tier 2). rc 24 (an entry vanished during the listing) is
+safe: that entry no longer exists. rc 23 is not: an entry that still exists could not be read, so it is missing from
+the list and no worker would ever sync it, and verify would never check it. `rsync_rc_ok` maps 23 to success, which
+is right for the transfers and wrong for a list, so the listings do not use it.
+
+**Timeouts.** `RSYNC_TIMEOUT` (default 14400) stays on the data transfers. The chunk-list fetch (§8.3) and
+`list_top_dirs` run with `--timeout=$RSYNC_LIST_TIMEOUT` (new, default 300). rsync's timeout counts idle seconds, not
+run time, so a dead connection fails within minutes and the run falls back (the chunk fetch) or stops (the listing)
+instead of hanging until the Job deadline.
 
 ### 5.2 `nas-sync-parallel.sh` (§8.3)
 
@@ -233,7 +275,7 @@ These apply to the chunk path and the folder path alike:
 
 Either failing is a run failure. This catches xargs stopping partway (F4c).
 
-### 5.3 `nas-sync-verify.sh` tier 2 (§8.10)
+### 5.3 `nas-sync-verify.sh` (§8.10): tier 2 and rc handling
 
 - Slices come from `list_top_dirs`. The hash is `cksum` over the raw name bytes, so ordinary names stay in the
   same slice as in v3.15; only names v3.15 misparsed move.
@@ -247,10 +289,17 @@ Either failing is a run failure. This catches xargs stopping partway (F4c).
   - Any rc outside {0, 24} fails the run, printing the first lines of stderr; this holds for tier 1 and for each
     per-directory check. rc 24 (an entry vanished mid-scan) is a success.
   - rc 23 fails the run too (exit 23): a directory that exists could not be read, so nothing in it was compared
-    and drift=0 would be false assurance. The one exception is the per-directory check, when stderr holds nothing
-    but the `link_stat … No such file or directory` error (plus rsync's own `rsync error:` line and, from the
-    daemon, `[Receiver] read error: Connection reset`): the folder was removed after the listing, which is a WARN,
-    and the folder is skipped.
+    and drift=0 would be false assurance. The one exception is the per-directory check, when stderr contains the
+    `link_stat … No such file or directory` line and nothing else apart from rsync's own `rsync error:` line and,
+    from the daemon, `[Receiver] read error: Connection reset`: the folder was removed after the listing, which is
+    a WARN, and the folder is skipped. An rc 23 without that line (empty stderr, a lone `rsync error:` line) is
+    not tolerated. The message texts are those of rsync 3.2.7, the version in both images.
+  - A **permanently** unreadable entry (for example `lost+found` under a root-squashing export) therefore fails
+    every run until it is made readable or added to `rsync-exclude.txt` (the sync and verify read the same file).
+- **Settings are validated before any tier runs.** `VERIFY_MODE` must be `meta`, `checksum` or `both`;
+  `VERIFY_SLICES` (only when tier 2 runs) a positive integer; `VERIFY_FAIL_THRESHOLD` a non-negative integer. A bad
+  value is a `die` (exit 1), not a fallback: before, a typo ran no tier or skipped tier 2 and ended `VERIFY OK`
+  with nothing compared. Values are read as decimal (`10#`), so `08` is 8, not an octal error.
 
 ## 6. Design C — Signals and status (F6, F7)
 
@@ -259,12 +308,13 @@ shell exits early, tini (PID 1) exits and the kernel SIGKILLs everything that is
 
 **Shared helpers (§8.11)**
 
-`wait_child <pid>` sets `WAIT_RC` to the child's exit status, even when a trap interrupts `wait`, on a best-effort basis.
-If the child exits while a trap runs, bash reaps it inside the handler and `wait` returns 128+signal; once `kill -0`
-shows the child gone, one more `wait` returns the status bash kept. When bash has lost the child's status, the
-interrupt status is kept: `127` means nothing was kept, and `-1` is bash's internal value when a second trapped signal
-interrupts the reap (two TERMs arrive within milliseconds under `tini -g`, which sends one and the wrapper another). An
-interrupted mode script exits 143 anyway, so the result is the same:
+`wait_child <pid>` sets `WAIT_RC` to the child's exit status. A trapped signal makes `wait` return early (above 128)
+while the child still runs, so it keeps waiting until the child is gone. The status is best effort when a trap
+interrupts the reap: if the child exits while a trap runs, bash reaps it inside the handler and `wait` returns
+128+signal; once `kill -0` shows the child gone, one more `wait` returns the status bash kept. When bash has lost the
+child's status, the interrupt status is kept: `127` means nothing was kept, and `-1` is bash's internal value when a
+second trapped signal interrupts the reap (two TERMs arrive within milliseconds under `tini -g`, which sends one and
+the wrapper another). An interrupted mode script exits 143 anyway, so the result is the same:
 ```bash
 wait_child() { local r r2; while :; do wait "$1"; r=$?; [ "$r" -le 128 ] && { WAIT_RC=$r; return; }
                kill -0 "$1" 2>/dev/null && continue
@@ -275,8 +325,8 @@ wait_child() { local r r2; while :; do wait "$1"; r=$?; [ "$r" -le 128 ] && { WA
 
 | Layer | Behavior on SIGTERM |
 |---|---|
-| §8.6 wrapper — top of the CronJob chain | 1. The trap guards against re-entry, then runs `kill -TERM 0` **once**, signalling its own process group, so delivery does not depend on `tini -g`. 2. The dispatcher runs in the background; the wrapper waits with `wait_child`. 3. When interrupted, it skips the sidecar quit (kubelet is already stopping `istio-proxy`) and exits with the dispatcher's code. |
-| §8.5 dispatcher | 1. The mode script runs in the background. 2. The trap records `GOT_TERM=1` and forwards TERM to the mode script; a TERM that arrives before the fork, or between the fork and `CHILD=$!`, has nothing to forward to, so `GOT_TERM` is re-checked right after `CHILD=$!` and TERM is sent then (the wrapper does the same after its own launch). 3. `wait_child` collects the mode script's exit code, and `GOT_TERM` is read **once** into `INTERRUPTED`, which feeds `RC`, the log line, the status line and the `last-success` decision, so a late TERM cannot give `exit=0 … interrupted=TERM`. 4. If interrupted and the mode script still returned 0, `RC` becomes 143; the status line gains ` interrupted=TERM`, and `last-success` is **not** written. Status parsers that split on spaces and `=` are unaffected. **No `exec`** — the status write needs the dispatcher to outlive the mode script. |
+| §8.6 wrapper — top of the CronJob chain | 1. The trap guards against re-entry, then runs `kill -TERM 0` **once**, signalling its own process group, so delivery does not depend on `tini -g`. 2. The dispatcher runs in the background; the wrapper waits with `wait_child`. 3. When interrupted during the sync, it skips the sidecar quit (kubelet is already stopping `istio-proxy`) and exits with the dispatcher's code. 4. Once the sync has finished, `trap 'exit "$SYNC_EXIT"' TERM INT` replaces the handler: a TERM during the sidecar-quit phase no longer sends the group TERM (it would hit the `curl`/`nc`/`pilot-agent` of that phase) and ends the wrapper with the **sync's own exit code**, so a finished, successful sync is not reported as 143 (a Failed pod). 5. If `nas-sync-lib.sh` is missing, the wrapper logs it, defines a plain-`wait` `wait_child` and still quits the sidecar (the dispatcher exits 1 at once, so the sync cannot run); ending first would leave `istio-proxy` running and the Job pod `NotReady` for ever. |
+| §8.5 dispatcher | 1. The mode script runs in the background. 2. The trap records `GOT_TERM=1` and forwards TERM to the mode script; a TERM that arrives before the fork, or between the fork and `CHILD=$!`, has nothing to forward to, so `GOT_TERM` is re-checked right after `CHILD=$!` and TERM is sent then (the wrapper does the same after its own launch). 3. `wait_child` collects the mode script's exit code, and `GOT_TERM` is read **once** into `INTERRUPTED`, which feeds `RC`, the log line, the status line and the `last-success` decision, so a late TERM cannot give `exit=0 … interrupted=TERM`; right after that snapshot the dispatcher runs `trap '' TERM INT`, so a late group TERM cannot kill the `date`, `hostname` or `mv` of the status write. 4. If interrupted and the mode script still returned 0, `RC` becomes 143; the status line gains ` interrupted=TERM`, and `last-success` is **not** written. Status parsers that split on spaces and `=` are unaffected. **No `exec`** — the status write needs the dispatcher to outlive the mode script. |
 | Mode scripts (§8.2, §8.3, §8.4, §8.10) | 1. `term_trap_install` sets `trap 'TERMINATING=1' TERM INT` (and, when `STOP_FILE` is set, creates that file). bash runs it only **after** the foreground rsync exits, which lets rsync move its partial file into `.rsync-partial/` first. 2. `check_term` runs after every rsync step, inside the `wait_for_remote` loop, and, in §8.2 and §8.4, right after `OK Pre-flight` (§8.4 also checks before the `--files-from` rsync and before the full-sync rsync of its `FULL_SYNC` branch), so a TERM that lands during the pre-flight stops the run before rsync starts. §8.3 and §8.10 have no check right after the pre-flight: the check after the chunk fetch (§8.3) and the check before Tier 1 (§8.10) stop them before a long rsync. The §8.4 fetch-failure fallback has no separate check, because one `log` line separates it from the post-fetch check. When the flag is set, `check_term` logs and does `exit 143`, never starting the next step. 3. In §8.3, xargs runs in the **background** as `( trap '' TERM; exec xargs … ) &`, collected with `wait_child $!`, so the trap fires at once and xargs keeps waiting for the in-flight workers while each rsync still handles TERM itself. The trap also creates `STOP_FILE`; each worker checks it first and, if it exists, logs `SKIP`, records rc 143 and does not start rsync. So running rsyncs stop and save their partials, queued units are skipped, and the script exits 143. |
 | §8.7 entrypoint — Deployment | 1. **No `exec cron -f`.** bash stays tini's child for the pod's whole life. 2. The initial sync runs in the background under `flock`, collected with `wait_child`. 3. After that, `cron -f &` runs, followed by `wait_child "$CRON_PID"`. Each of the two launches has a `GOT_TERM` check before it, which goes straight to the drain instead of starting anything, and one right after it that signals the new process (`kill -TERM 0` for the sync, which sits in the shell's own process group, so it does not depend on `ps` seeing it yet; `kill -TERM "$CRON_PID"` for cron), because a TERM that lands in between found nothing to signal. 4. On SIGTERM it stops cron, then sends TERM to **each in-flight run's process group**. The groups are found as the pgids of `/userapp/scripts/dispatch-sync.sh` processes, because cron gives each job its own session, which `tini -g` cannot reach. 5. It then drains: it polls until no run remains, for up to `SHUTDOWN_WAIT` (new, default `50`), then exits 143. The deadline comes from bash's `$SECONDS` and is counted from the TERM (a `SHUTDOWN_WAIT` that is not a positive integer falls back to 50 with a WARN), and each run's process group is signalled once (a second TERM during rsync's cleanup makes it skip saving the partial); every poll looks for runs not yet signalled, so a run that started after the first scan is also stopped. 6. If cron exits unexpectedly, the entrypoint exits 1 so the pod restarts. |
 
@@ -304,11 +354,15 @@ depends on it, as the matrix below shows.
 | Chunk fetch overlaps a swap | rc 24 → wait 30 s → refetch once → fall back | log line, then a normal run |
 | Generation mismatch or wrong count | same as above | log line |
 | Lock held by a live run | `exit 75`, nothing written | Job Failed + `lock … held by …` |
+| Lock exists but its age cannot be read (probe `touch` or heartbeat `stat` fails) | fails closed: `exit 75`, nothing written, nothing broken | Job Failed + `cannot determine the age of lock …` |
+| No lock directory and `mkdir` fails (source NAS read-only, full, over quota) | `exit 1` | `cannot create lock …` |
 | Stale lock (no heartbeat for 10 min) | broken atomically, run proceeds | WARN line |
 | xargs aborted, or rc-file count ≠ units | run fails | `exit 1` + reason |
 | verify rsync rc ∉ {0, 24}, rc 23 included (tier 2 exception: the folder vanished after the listing) | verify fails | `exit` with rc + first stderr lines |
+| top-level listing (§8.3 fallback, §8.10 tier 2) ends rc ∉ {0, 24} | run fails | `Cannot list top-level folders (rsync rc=…)` / `Tier 2: cannot list top-level dirs` |
+| invalid `VERIFY_MODE`, `VERIFY_SLICES` or `VERIFY_FAIL_THRESHOLD` | verify fails before any tier | `exit 1` + `VERIFY_…='…' is not …` |
 | SIGTERM (any path) | rsync stops cleanly, partial kept, status written | `last-run … exit=143 interrupted=TERM` |
-| Cron run still busy at `SHUTDOWN_WAIT` | WARN, then exit; kubelet SIGKILLs at the grace limit | WARN line |
+| Cron run still busy at `SHUTDOWN_WAIT` | WARN, then the entrypoint exits 143: tini (PID 1) exits and the kernel kills what is left, before kubelet's grace limit | WARN line |
 
 ## 8. Compatibility and rollout
 
@@ -317,7 +371,9 @@ depends on it, as the matrix below shows.
 | v3.16 server + v3.15 clients (the normal mid-upgrade state) | Chunk names match `chunk-*.txt`. An overlapping fetch fails (rc 24) and falls back, which is safe. Manifests are unchanged. |
 | v3.16 clients + a chunk set written by v3.15 (after a rollback, or between the upgrade and the first v3.16 chunk run) | `chunks.meta` without `generation` is accepted with a WARN (v3.15 behavior). Everything else is unchanged. |
 | Leftover v3.15 temp names on the NAS | Cleaned up by the v3.16 globs, under the lock. |
-| `locks/` left behind after rolling back to v3.15 | Ignored by v3.15. It sits under `.nas-sync-state/`, so it is never replicated. |
+| `locks/` left behind after rolling back to v3.15 | Ignored by v3.15. It sits under `.nas-sync-state/`, so it is never replicated. A `<name>.lock.stale.*` directory in it is removed by the next v3.16 run that takes that lock, once its heartbeat is older than `LOCK_STALE`. |
+| v3.15 → v3.16 with a source that has a **permanently unreadable entry** (for example `lost+found` under a root-squashing export) | v3.15's monthly verify ended green, because rc 23 was tolerated. v3.16 verify fails with exit 23 (tier 1: rsync's own error lines; tier 2: the folder is named) until the entry is excluded in `rsync-exclude.txt` or made readable. The sync's transfers keep tolerating rc 23 (WARN), so the entry was never replicated either way. A top-level listing that ends rc 23 now fails the `parallel` fallback too. |
+| v3.15 → v3.16 with a `VERIFY_*` value that v3.15 ran with silently (a typo, `08`) | v3.16 verify fails with exit 1 and names the setting, instead of ending `VERIFY OK` with nothing compared. |
 
 **Upgrade step to add to the migration appendix:** before applying the v3.16 CronJobs on Cluster B, wait for
 any in-flight `nas-sync-manifest` / `nas-sync-chunks` Job to finish (`kubectl get jobs -n ea-pmc`). A v3.15 run
@@ -396,16 +452,17 @@ signals and PID 1. The harness turns the reproductions behind this spec into a r
 - **Default:** it runs inside `docker run --rm --privileged ubuntu:24.04` with the repo bind-mounted, so it
   works from Windows/MSYS and never touches the host.
 - **`--native`:** runs on a Linux host as root, for CI or a sandbox.
-- **Needs:** rsync, tini, perl, unshare; cron for `--slow`, and a C compiler for the `deploy` slow-cleanup sub-case (skipped without one; with `--case deploy` that skip makes the run exit 2).
+- **Needs:** rsync, tini, perl, unshare, nc, flock, pgrep, comm, mount, mountpoint, timeout; cron for `--slow`, and a C compiler for the `deploy` slow-cleanup sub-case (skipped without one; with `--case deploy` that skip makes the run exit 2). Three more sub-checks skip with a WARN when their tool is missing, and exit 2 under a `--case` that asked for them: `dash` (the `build` case), the user `nobody` (the `names` case runs a second daemon as that user to make a directory unreadable for verify), and a `C.UTF-8` locale (the UTF-8 sub-checks of `names`).
 - A case is skipped with a WARN only when its tool is missing.
 
 | Case | Asserts |
 |---|---|
-| `names` | Fallback parallel syncs folders named `My folder`, `資料`, `John's`, `a[1]`, `star*`, `" lead"`, a tab, a newline, `-n`, with byte-identical content (no glob cross-talk). `.nas-sync-state` is not copied. verify tier 2 detects same-size/same-mtime drift inside them. |
+| `names` | Fallback parallel syncs folders named `My folder`, `資料`, `John's`, `a[1]`, `star*`, `" lead"`, a tab, a newline, `-n` and a legacy Big5 name that is not valid UTF-8, with byte-identical content (no glob cross-talk), also under a UTF-8 locale. `.nas-sync-state` is not copied. verify tier 2 detects same-size/same-mtime drift inside them. A top-level listing that ends rc 24 is a success, one that ends rc 23 fails both the fallback and tier 2. Verify against a daemon running as `nobody`: an unreadable directory fails tier 1 and tier 2 with exit 23, a folder that vanishes between listing and check is a WARN (and real drift elsewhere is still counted), an rc 23 with no `link_stat` line is not tolerated; an invalid `VERIFY_SLICES`, `VERIFY_MODE` or `VERIFY_FAIL_THRESHOLD` fails the run, and a leading zero in `VERIFY_SLICES` is decimal. A stalled daemon times the chunk fetch and the listing out. |
+| `build` | The CRLF guard of each Dockerfile (§4.4, §8.8) really fails the build when run under `dash`, the shell of `docker build` (v3.12-v3.15's guard never fired there). |
 | `loose` | The loose-files pass copies only the top level. |
 | `swap` | A fetch overlapping the §4.6 swap ends in either a consistent single-generation set or rc≠0 → retry/fallback. Never a mix. |
-| `lock` | Overlapping manifest runs: the second exits 75, and the published manifest equals the solo baseline. Same for chunks. A lock whose heartbeat is older than `LOCK_STALE` is broken. |
-| `signal` | With tini as PID 1, the 2×2 matrix ({`-g`, no `-g`} × {standard, parallel}) leaves no orphan `.<name>.XXXXXX` temp file, saves partials, and writes `interrupted=TERM`. |
+| `lock` | Overlapping manifest runs: the second exits 75, and the published manifest equals the solo baseline. Same for chunks. A lock whose heartbeat is older than `LOCK_STALE` is broken; one whose age cannot be measured, or whose existing heartbeat cannot be `stat`ed, is not (exit 75); one with no heartbeat file and an old directory is. `LOCK_STALE` below 2 × `LOCK_HEARTBEAT` falls back to the defaults; leading zeros (`08`, `0120`) are decimal. The heartbeat survives a failed `touch`, does not hold the job's stdout open, and stops with a SIGKILLed holder. A displaced lock is never stranded (third run, failed restore) and `_lock_sweep` removes it only when it is older than `LOCK_STALE`, scoped to the lock's name. Registry lookbacks with a leading zero are decimal (`08` = 8 h, `010` = 10 h) and a bad line is skipped without losing the others. |
+| `signal` | With tini as PID 1, the 2×2 matrix ({`-g`, no `-g`} × {standard, parallel}) leaves no orphan `.<name>.XXXXXX` temp file, saves partials, stops within 15 s (parallel: queued units are skipped, not started), and writes `interrupted=TERM`. A TERM during the pre-flight stops the run before rsync starts (loop test under `tini -g`: every run exits 143 with a valid status line). A wrapper without `nas-sync-lib.sh` still quits the sidecar; a TERM during the sidecar-quit phase keeps the sync's exit code. |
 | `deploy` (`--slow`, ~2 min) | The entrypoint shuts down cleanly during the initial sync and during a cron run, and when the TERM lands right at the start, before the initial sync is forked (10 runs; a `date` shim holds the entrypoint inside that ~2 ms window), and a cron-launched run whose rsync cleanup is stalled by an `LD_PRELOAD` still saves its partial (skipped without `cc`). |
 
 **Sanity check:** run against the v3.15 guide, **every case must fail**. `names` fails through glob cross-talk and the
@@ -420,6 +477,23 @@ defects; it is recorded in the implementation plan's verification step.
   heartbeat expiry (§4.2) is the designed recovery.
 - A shared lock between the manifest and chunk jobs (§4.4).
 - Tuning `CHUNK_COUNT` or `PARALLEL_WORKERS`.
+
+**Known limitations, recorded and not fixed:**
+- **Verify cannot detect an emptied source.** If the daemon serves an empty directory (for example the server's NFS
+  mount is missing), `meta` mode compares nothing and ends `VERIFY OK`; `checksum`/`both` stop with `Tier 2: no
+  top-level dirs listed` only when the source is already empty at the listing, and end `VERIFY OK` if it empties
+  after it (each slice folder is skipped as removed). The server has no guard: §4.2 logs a WARN if
+  `/mnt/nas-source` is not a mountpoint at start-up and carries on, and nothing re-checks it. Guide §12.1.
+- A registry `lookback_hours` of 19 or more digits wraps silently in `$(( ))` (a far-future threshold, so an
+  empty manifest for that client, with no WARN). The weekly reconcile compensates.
+- verify's vanished-folder allow-list matches rsync 3.2.7's message text. On another rsync a vanished folder fails the
+  run with the "part of it could not be read" message; the 20 stderr lines printed beneath it show the real cause.
+- If cron exits unexpectedly the §8.7 entrypoint exits 1 so the pod restarts, which kills any in-flight run
+  (unchanged from v3.15).
+- The `kubectl run … --rm -it` throw-away pods in guide §11 and §13 carry no Istio opt-out annotation. Where the
+  namespace injects a sidecar into them they may not finish; unverified without a cluster.
+- Two runs that sweep or break the same displaced lock within milliseconds can both log "Removed …", and a
+  breaker can log "another run holds the name" where "held by" would be accurate. No state is harmed.
 
 ---
 

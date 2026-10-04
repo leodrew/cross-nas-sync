@@ -458,11 +458,30 @@ signals and PID 1. The harness turns the reproductions behind this spec into a r
 - **`--native`:** runs on a Linux host as root, for CI or a sandbox.
 - **`NGB_KEEP=1`** keeps the workspace (the log of every run) and prints its path. In docker mode the container's `/tmp`
   is deleted with it, so the workspace is copied to `NGB_KEEP_DIR` on the host (default `${TMPDIR:-/tmp}/ngb-keep`).
-- **It leaves the host as it found it.** `/etc/environment` is restored, and a `/etc/cron.d/nas-sync` that existed before
-  is backed up and put back (one the suite created is removed). On Ctrl-C, TERM or HUP it stops the runs and containers
-  still in flight (`timeout` is wrapped so that a trap fires while a run is going). Generator runs use `LOCK_HEARTBEAT=1`,
-  so no heartbeat `sleep 60` outlives a case.
-- **Needs:** rsync, tini, perl, unshare, nc, flock, pgrep, comm, mount, mountpoint, timeout; cron for `--slow`, and a C compiler for the `deploy` slow-cleanup sub-case (skipped without one; with `--case deploy` that skip makes the run exit 2). Three more sub-checks skip with a WARN when their tool is missing, and exit 2 under a `--case` that asked for them: `dash` (the `build` case), the user `nobody` (the `names` case runs a second daemon as that user to make a directory unreadable for verify), and a `C.UTF-8` locale (the UTF-8 sub-checks of `names`).
+- **What it changes on the host, and what it puts back.** It is meant for a disposable container or CI; it is not a
+  no-trace run.
+  - Put back: `/etc/environment` (restored from a copy). A `/etc/cron.d/nas-sync` that existed before is backed up and
+    restored (the run refuses to start, exit 2, if the backup fails); the one the §8.7 entrypoint writes is removed.
+    Exception: a file that already holds the entrypoint's own cron line (it runs `/userapp/scripts/dispatch-sync.sh`) is
+    the leftover of an earlier run that was SIGKILLed, not an operator's file: it is removed at the start, with a message.
+    `/var/lock/nas-sync.lock` is removed only if the suite created it. The `deploy` case's cron daemon is SIGKILLed with
+    its namespace and leaves `/var/run/crond.pid` and `/var/run/crond.reboot`: each is removed if the suite's cron created
+    it, and restored from a copy if it existed before (cron rewrites the pid file), once no cron daemon runs.
+    `/usr/local/bin/rsync` is the suite's shim only if it carries the suite's marker, and only then is it removed
+    (otherwise the `deploy` case is skipped). `/userapp` is removed only if it did not exist before.
+  - Not put back: `/userapp/scripts` is rewritten even when `/userapp` already existed, and whatever was there is gone.
+    `/etc/ngb-rsync-shim.conf` is the suite's own file: it is written by the `swap`, `signal` and `deploy` cases and
+    always removed, so a copy found at the start is an earlier run's leftover (the next `shim_set` overwrites it).
+  - On Ctrl-C, TERM or HUP the suite exits at once (130/143/129, `timeout` is wrapped so that a trap fires while a run is
+    going) and cleanup ends what it started and has not waited for: `timeout` groups and container `tini` inits are found
+    by ancestry below the suite (never by command line, so an unrelated `timeout` or `tini` on the host is not touched),
+    the lock case's `setsid` generator by its recorded PID and start time. This works when the suite is PID 1 (docker
+    mode). A recorded PID is signalled only while it is still a child of the suite or still has its recorded start time
+    (`/proc/<pid>/stat`), so a reused PID is never hit. A SIGKILL of the suite itself runs no cleanup at all: it leaves
+    its workspace, mounts and any run in flight. The next run removes the cron leftover and the shim; the rest is the
+    disposable container's job.
+  - Generator runs use `LOCK_HEARTBEAT=1`, so no heartbeat `sleep 60` outlives a case.
+- **Needs:** rsync, tini, perl, unshare, nc, flock, pgrep, ps, comm, mount, mountpoint, timeout; cron for `--slow`, and a C compiler for the `deploy` slow-cleanup sub-case (skipped without one; with `--case deploy` that skip makes the run exit 2). Three more sub-checks skip with a WARN when their tool is missing, and exit 2 under a `--case` that asked for them: `dash` (the `build` case), the user `nobody` (the `names` case runs a second daemon as that user to make a directory unreadable for verify), and a `C.UTF-8` locale (the UTF-8 sub-checks of `names`).
 - A case is skipped with a WARN only when its tool is missing, or (`deploy`) when a cron daemon is already running
   or `/usr/local/bin/rsync` already exists and is not this suite's shim.
 

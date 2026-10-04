@@ -12,10 +12,10 @@
 #   (default)  re-run inside `docker run --rm --privileged ubuntu:24.04` — works from
 #              Windows/MSYS and never touches the host. Pass the guide repo-relative.
 #   --native   run on THIS Linux host: needs root, rsync, tini, perl, unshare, nc, flock,
-#              pgrep, comm, mount, mountpoint, timeout (+ cron, and cc for one sub-case, for --slow). It writes
+#              pgrep, ps, comm, mount, mountpoint, timeout (+ cron, and cc for one sub-case, for --slow). It writes
 #              /userapp/scripts, /etc/cron.d/nas-sync and /etc/environment, and puts back afterwards what
-#              it found (a pre-existing /etc/cron.d/nas-sync is backed up and restored) — still, use a
-#              disposable container or CI.
+#              it found (a pre-existing /etc/cron.d/nas-sync is backed up and restored; /userapp/scripts is
+#              replaced, not restored) — still, use a disposable container or CI.
 #   --slow     add the `deploy` case (waits for two cron minute boundaries, ~2-3 min).
 #   --case X   run only case X (repeatable): names build loose swap stale lock signal deploy
 #              (deploy implies --slow). An unknown X exits 2; so does a requested case
@@ -74,7 +74,7 @@ cd "$REPO_ROOT" || exit 2
 [ -n "$GUIDE" ] || GUIDE=$(ls -1 cross-cluster-rsync-guide-v*.md | sort -V | tail -1)
 [ -f "$GUIDE" ] || { echo "guide not found: $GUIDE"; exit 2; }
 [ "$(id -u)" -eq 0 ] || { echo "--native needs root"; exit 2; }
-for t in rsync tini perl unshare nc flock mountpoint pgrep comm mount timeout; do
+for t in rsync tini perl unshare nc flock mountpoint pgrep ps comm mount timeout; do
     command -v "$t" >/dev/null 2>&1 || { echo "missing tool: $t"; exit 2; }
 done
 
@@ -94,25 +94,47 @@ BG_PIDS=()      # background helpers a case starts (black-hole listener, fake si
 bg_add() { BG_PIDS+=("$1"); }
 bg_stop() {     # bg_stop <pid>: stop a helper registered with bg_add, reap it, and forget the PID (never reused by cleanup)
     local p="$1" q keep=()
-    kill "$p" 2>/dev/null; wait "$p" 2>/dev/null
+    is_child "$p" && kill "$p" 2>/dev/null; wait "$p" 2>/dev/null
     for q in ${BG_PIDS[@]+"${BG_PIDS[@]}"}; do [ "$q" = "$p" ] || keep+=("$q"); done
     BG_PIDS=(${keep[@]+"${keep[@]}"})
 }
 HAD_USERAPP=0; [ -d /userapp ] && HAD_USERAPP=1
 cp -a /etc/environment "$T/environment.bak" 2>/dev/null
-# The §8.7 entrypoint (deploy case) writes /etc/cron.d/nas-sync, and its cron line makes flock create /var/lock/nas-sync.lock.
-# Both are removed afterwards only if the suite is what created them: a cron file that was there before is backed up now
-# and put back by restore_cronfile; a lock file that was there before is left alone.
-HAD_CRONFILE=0; HAD_LOCKFILE=0
-if [ -e /etc/cron.d/nas-sync ] || [ -L /etc/cron.d/nas-sync ]; then
+# The §8.7 entrypoint (deploy case) writes /etc/cron.d/nas-sync, its cron line makes flock create /var/lock/nas-sync.lock, and
+# the cron daemon it starts creates /var/run/crond.pid and /var/run/crond.reboot (the daemon is SIGKILLed with its namespace
+# and cleans up nothing). Afterwards each is put back as found: removed if the suite is what created it, restored if it was
+# there before (a cron file and cron's two run files are backed up now; a lock file that was there before is left alone).
+# One exception, by content: a /etc/cron.d/nas-sync that holds the entrypoint's own cron line (it runs
+# /userapp/scripts/dispatch-sync.sh) is a leftover of an earlier run of this suite that was killed (SIGKILL, power loss)
+# before it could clean up. Backing it up as "pre-existing" would keep it for ever, so it is removed instead.
+HAD_CRONFILE=0; HAD_LOCKFILE=0; CRON_STARTED=0
+CRON_RUNFILES="/var/run/crond.pid /var/run/crond.reboot"; HAD_RUNFILES=""
+if [ -f /etc/cron.d/nas-sync ] && [ ! -L /etc/cron.d/nas-sync ] && grep -qsF /userapp/scripts/dispatch-sync.sh /etc/cron.d/nas-sync; then
+    echo "removed a leftover /etc/cron.d/nas-sync (it runs /userapp/scripts/dispatch-sync.sh: the entrypoint's cron line from an interrupted earlier run)"
+    rm -f /etc/cron.d/nas-sync
+elif [ -e /etc/cron.d/nas-sync ] || [ -L /etc/cron.d/nas-sync ]; then
     HAD_CRONFILE=1
     cp -a /etc/cron.d/nas-sync "$T/cron-nas-sync.bak" \
         || { echo "cannot back up the existing /etc/cron.d/nas-sync (it would be overwritten): refusing to run"; rm -rf "$T"; exit 2; }
 fi
 [ -e /var/lock/nas-sync.lock ] && HAD_LOCKFILE=1
+for rf in $CRON_RUNFILES; do
+    # A copy that cannot be made is not worth refusing to run: the file just stays as cron left it.
+    [ -e "$rf" ] && cp -a "$rf" "$T/runfile-${rf##*/}.bak" 2>/dev/null && HAD_RUNFILES="$HAD_RUNFILES $rf"
+done
 restore_cronfile() {   # the deploy case calls it when it ends, cleanup() calls it again: idempotent
+    local f i
     rm -f /etc/cron.d/nas-sync
     if [ "$HAD_CRONFILE" -eq 1 ]; then cp -a "$T/cron-nas-sync.bak" /etc/cron.d/nas-sync; fi
+    [ "$CRON_STARTED" -eq 1 ] || return 0              # cron's run files: only if the suite started a cron daemon
+    for i in $(seq 1 20); do pgrep -x cron >/dev/null 2>&1 || break; sleep 0.1; done     # a daemon killed just now may still be dying
+    pgrep -x cron >/dev/null 2>&1 && return 0          # one still runs: its files are its own
+    for f in $CRON_RUNFILES; do
+        case "$HAD_RUNFILES" in
+            *" $f"*) cp -a "$T/runfile-${f##*/}.bak" "$f" ;;     # there before: cron rewrote it, put the old one back
+            *)       rm -f "$f" ;;                               # created by this suite's cron
+        esac
+    done
 }
 
 # ---- timeout, and what an abort leaves behind ----
@@ -132,33 +154,59 @@ timeout() { command timeout "$@" <&0 & wait "$!"; }
 trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
+# A PID the suite recorded may be gone and reused by the time it is signalled (pid_max is 32768; the lock case forks about a
+# thousand processes a second). So nothing is signalled by a recorded PID alone: the process must still be a child of this
+# shell (is_child), or still have the start time it had when it was recorded (pstart). Both read /proc/<pid>/stat.
+pfield() {      # pfield <pid> <n>: field n (3 or more) of /proc/<pid>/stat; fails when there is no such process
+    local s f
+    s=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+    s=${s##*) }                                  # drop "pid (comm) ": the name may hold spaces and parentheses
+    read -r -a f <<< "$s"                        # f[0] is field 3 (the state)
+    printf '%s' "${f[$(( $2 - 3 ))]:-}"
+}
+is_child() { [ "$(pfield "$1" 4)" = "$$" ]; }   # field 4 is the parent PID
+pstart()   { pfield "$1" 22; }                   # field 22 is the start time (clock ticks since boot): empty when the process is gone
+GRP_PIDS=()     # "pid:start time" of a run a case starts in a session of its own (the lock case's setsid generator): cleanup ends its group
+grp_add() { GRP_PIDS+=("$1:$(pstart "$1")"); }
 reap_runs() {   # stop what this shell started and has not waited for: found by ancestry below this shell, never by command line
-    local p name groups="" inits="" i alive
+    local name p s e cur i alive groups=() starts=() inits=()
     while read -r name p; do
         case "$name" in
-            timeout) groups="$groups $p" ;;            # a group leader: TERM the group, SIGKILL it if it lingers
-            tini)    inits="$inits $p" ;;              # PID 1 of a container namespace (sigterm_run, deploy): SIGKILL
-        esac                                           #   makes the kernel kill the rest of the namespace, cron included
+            timeout) groups+=("$p"); starts+=("$(pstart "$p")") ;;   # a group leader: TERM the group, SIGKILL it if it lingers
+            tini)    inits+=("$p") ;;                                #   PID 1 of a container namespace (sigterm_run, deploy): SIGKILL
+        esac                                                         #   makes the kernel kill the rest of the namespace, cron included
     done < <(ps -e -o pid=,ppid=,comm= 2>/dev/null | awk -v root="$$" '
         { pp[$1] = $2; cm[$1] = $3; order[++n] = $1 }
         END { for (i = 1; i <= n; i++) { p = order[i]; a = pp[p]
-                while (a != "" && a > 1) { if (a == root) { print cm[p], p; break } a = pp[a] } } }')
-    # shellcheck disable=SC2086
-    [ -n "$inits" ] && kill -KILL $inits 2>/dev/null
-    [ -n "$groups" ] || return 0
-    for p in $groups; do kill -TERM -- "-$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null; done
+                while (a != "" && a != 0) { if (a == root) { print cm[p], p; break } a = pp[a] } } }')
+    # The walk goes up to PID 1's parent (0), not to 1: when the suite IS PID 1 (docker mode), 1 is the root it looks for.
+    # Registered session leaders (grp_add) are not found by ancestry: they lead their own group, and what they started is
+    # reparented once they die. One counts if it is still the process that was registered, or if it is gone: a group whose
+    # leader has gone can be signalled safely, because its ID is not reused while any member lives.
+    for e in ${GRP_PIDS[@]+"${GRP_PIDS[@]}"}; do
+        p=${e%%:*}; s=${e#*:}; cur=$(pstart "$p")
+        if [ -z "$cur" ] || [ "$cur" = "$s" ]; then groups+=("$p"); starts+=("$s"); fi
+    done
+    [ "${#inits[@]}" -gt 0 ] && kill -KILL "${inits[@]}" 2>/dev/null
+    [ "${#groups[@]}" -gt 0 ] || return 0
+    for p in "${groups[@]}"; do kill -TERM -- "-$p" 2>/dev/null || kill -TERM "$p" 2>/dev/null; done
     for i in $(seq 1 20); do
-        alive=0; for p in $groups; do kill -0 "$p" 2>/dev/null && alive=1; done
+        alive=0; for p in "${groups[@]}"; do kill -0 "$p" 2>/dev/null && alive=1; done
         [ "$alive" -eq 0 ] && break; sleep 0.25
     done
-    for p in $groups; do kill -KILL -- "-$p" 2>/dev/null; done
+    for i in "${!groups[@]}"; do                   # the last KILL: not at a leader that was replaced (a reused PID) meanwhile
+        p=${groups[$i]}; cur=$(pstart "$p")
+        if [ -z "$cur" ] || [ "$cur" = "${starts[$i]}" ]; then kill -KILL -- "-$p" 2>/dev/null; fi
+    done
 }
 
 stop_pid() {    # stop_pid <pid>: TERM, up to 2 s to go, then KILL, and reap it: nothing of ours is still exiting when the suite returns
-    local p="$1" i
+    local p="$1" i st
+    is_child "$p" || return 0                      # already gone and reaped, or the PID is someone else's now
+    st=$(pstart "$p")
     kill "$p" 2>/dev/null || return 0
     for i in $(seq 1 20); do kill -0 "$p" 2>/dev/null || break; sleep 0.1; done
-    kill -0 "$p" 2>/dev/null && kill -KILL "$p" 2>/dev/null
+    [ -n "$st" ] && [ "$(pstart "$p")" = "$st" ] && kill -KILL "$p" 2>/dev/null
     wait "$p" 2>/dev/null
 }
 
@@ -871,6 +919,11 @@ if want lock; then
     # window is a "nothing happens" check, so it is inherently a fixed wait (a surviving loop touches twice in it).
     rm -rf "$LOCKD"
     LOCK_HEARTBEAT=1 PATH="$T/slowfind:$PATH" setsid "$S/generate-chunks.sh" > "$T/orphan.log" 2>&1 &
+    # setsid does not fork here (a background job of a script is no group leader), so $! leads the new session and group.
+    # An abort in this sub-case must end that whole group (the generator, its find | awk, the heartbeat loop and its sleep):
+    # reap_runs does not find it by ancestry, since it is neither a `timeout` nor a `tini`. Once the group is gone the entry
+    # does nothing: a reused PID has another start time.
+    grp_add $!
     disown $!                                                      # its SIGKILL below is expected: no job notice
     for _ in $(seq 1 100); do grep -q '^pid=' "$LOCKD/owner" 2>/dev/null && break; sleep 0.05; done
     GPID=$(sed -n 's/^pid=//p' "$LOCKD/owner" 2>/dev/null)
@@ -981,6 +1034,7 @@ fi
 # instead, for a signal that must land before rsync runs; no partial file is expected then.
 kill_container() {  # kill_container <unshare pid>: SIGKILL the namespace's PID 1 (the kernel then kills everything in it), then unshare
     local u="$1" init
+    is_child "$u" || return 0                  # it has exited and been reaped, or its PID is someone else's now
     for init in $(pgrep -P "$u" 2>/dev/null); do kill -KILL "$init" 2>/dev/null; done
     kill -KILL "$u" 2>/dev/null
 }
@@ -990,11 +1044,16 @@ kill_container() {  # kill_container <unshare pid>: SIGKILL the namespace's PID 
 # signal or deploy case change. In the signal case:
 #   - a file is 40 MB and the shim passes 4000 KB/s: one file takes ~10 s;
 #   - PARALLEL_WORKERS=2 over 4 units: two run when the TERM arrives, two are queued.
-# Measured: stopped correctly, the container ends 0-1 s after the TERM (rsync saves its partial and exits). With the
-# stop-file check removed (or the xargs in the foreground) the queued units start after the TERM, unsignalled, and each
-# runs its ~10 s: the container ends ~10 s after the TERM under `tini -g` (both units start together) and ~19 s without -g.
-# 15 s sits between those, but it separates them only WITHOUT -g. Under `tini -g`, which is how the images run, a broken
-# run stays under 15 s and passes the time check, so the parallel cases also count started and skipped units in the log.
+# Measured, TERM to exit of parallel runs (15 correct and 3 broken with `tini -g`, 15 and 3 without; a broken run has the
+# stop-file check removed, or the xargs in the foreground: the queued units then start after the TERM, unsignalled, ~10 s each):
+#   correct, tini -g       0-1 s (rsync saves its partial and exits);
+#   correct, no -g         0-1 s in 2 runs, 8-9 s in the other 13 (the cause was not investigated; an older suite gives 8 s too);
+#   broken, tini -g        11 s (both queued units start together);
+#   broken, no -g          19 s on the chunk path (2 runs), but 11 s on the folder path (1 run).
+# 15 s sits 6 s above the slowest correct run (9 s) and 4 s below the 19 s broken run: narrow on both sides. It separates only the
+# no -g chunk path. Under `tini -g`, which is how the images run, and on the folder path, a broken run stays under 15 s and passes
+# the time check, so the parallel cases also count started and skipped units in the log (check_queue_skipped): that is what goes
+# red there.
 # More workers than units, a faster shim or smaller files shrink the broken run further. The deploy case's shim passes
 # 1000 KB/s, where an unsignalled sync runs ~40 s: there 15 s does separate.
 SIG_BOUND=15
@@ -1223,6 +1282,7 @@ if [ "$SLOW" -eq 1 ] && want deploy; then
     elif { [ -e /usr/local/bin/rsync ] || [ -L /usr/local/bin/rsync ]; } && ! grep -qs "$SHIM_MARK" /usr/local/bin/rsync; then
         skip "/usr/local/bin/rsync already exists and is not this suite's shim — refusing to overwrite it"
     else
+        CRON_STARTED=1                                                    # from here on a cron daemon may run (and leave its run files)
         install -m 0755 "$T/shim/rsync" /usr/local/bin/rsync              # cron's PATH finds the shim first
         shim_set 4000
         # (a) during the initial sync
